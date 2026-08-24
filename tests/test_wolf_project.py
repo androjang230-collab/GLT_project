@@ -179,6 +179,10 @@ class WolfProjectIntegrationTests(unittest.TestCase):
         )
         fill = self.manager.tm_fill(self.project)
         self.assertEqual(1, fill.filled)
+        (self.project / "translation_memory.jsonl").write_text("", encoding="utf-8")
+        update = self.manager.tm_update(self.project)
+        self.assertEqual(1, update.added)
+        self.assertEqual(0, len(update.issues))
 
         (self.project / "glossary.csv").write_text(
             "source,target,type,locked\n原文,필수용어,term,true\n",
