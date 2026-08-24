@@ -1,0 +1,3 @@
+# Optional at runtime; enables WOFF2 cmap inspection. TTF/OTF/WOFF have a
+# standard-library fallback so the core toolkit remains usable without it.
+fonttools[woff]>=4.53.0

@@ -1,0 +1,63 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.venv/
+venv/
+env/
+
+build/
+dist/
+*.spec
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+*.log
+
+# Local QA/apply output and scratch directories.
+reports/
+output/
+outputs/
+staging/
+temp/
+tmp/
+
+# Root-level extracted/translated JSONL files are local working data. Synthetic
+# fixtures under tests/ remain trackable when they are deliberately added.
+/*.jsonl
+
+# WOLF/RPG Maker game installations and official text-export working trees.
+**/Data_AutoTXT/
+**/Data_AutoTXT_*/
+**/BasicData/
+**/MapData/
+**/Data/*.dat
+**/Data/*.mps
+*.wolf
+*.wolfx
+[Gg]ame.exe
+[Gg]ame[Pp]ro.exe
+[Ee]ditor.exe
+[Cc]onfig.exe
+
+# Deliberately authored, minimal synthetic fixtures may be versioned here.
+!tests/fixtures/synthetic/
+!tests/fixtures/synthetic/**
+
+# Local credentials and environment overrides. A documented example may be
+# committed explicitly as .env.example.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
