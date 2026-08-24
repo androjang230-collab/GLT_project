@@ -17,6 +17,12 @@ from engines.wolf.text_models import WolfTextReport
 from engines.wolf.text_qa import WolfQaResult, WolfTextQa
 from engines.wolf.text_writer import WolfTextWriter, WolfWriteReport
 from core.translation_io import write_jsonl
+from engines.wolf.editor_integration import (
+    WolfEditorDetection,
+    WolfEditorIntegrationResult,
+    WolfEditorIntegrationValidator,
+    WolfEditorLocator,
+)
 
 
 class WolfRPGEngine(EnginePlugin):
@@ -70,6 +76,38 @@ class WolfRPGEngine(EnginePlugin):
             translation_file,
             output_directory,
             dry_run=dry_run,
+        )
+
+    def check_editor(
+        self, editor: Path | None, *, project: Path | None = None
+    ) -> WolfEditorDetection:
+        locator = WolfEditorLocator()
+        resolved = locator.resolve(project, editor)
+        return locator.check(
+            resolved,
+            project=project,
+            provenance=("explicit_path" if editor is not None else "auto_resolved"),
+        )
+
+    def validate_editor_integration(
+        self,
+        project: Path,
+        *,
+        editor: Path | None = None,
+        target: str = "ALL",
+        allow_editor_import: bool = False,
+        workspace: Path | None = None,
+        keep_workspace: bool = False,
+        timeout_seconds: int = 120,
+    ) -> WolfEditorIntegrationResult:
+        return WolfEditorIntegrationValidator().validate(
+            project,
+            editor=editor,
+            target=target,
+            allow_editor_import=allow_editor_import,
+            workspace=workspace,
+            keep_workspace=keep_workspace,
+            timeout_seconds=timeout_seconds,
         )
 
 

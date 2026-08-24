@@ -29,6 +29,13 @@ from engines.wolf.text_extractor import (
 )
 from engines.wolf.text_qa import WolfQaResult, write_wolf_qa_report
 from engines.wolf.text_writer import WolfWriteReport, write_wolf_apply_report
+from engines.wolf.editor_integration import (
+    DEFAULT_EDITOR_TIMEOUT_SECONDS,
+    MAX_EDITOR_TIMEOUT_SECONDS,
+    WolfEditorDetection,
+    WolfEditorIntegrationResult,
+    write_wolf_editor_report,
+)
 from projects.manager import ProjectManager
 from projects.models import ProjectError, ProjectValidationError
 
@@ -204,6 +211,59 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("reports/wolf_apply_report.json"),
         help="portable write report (default: ./reports/wolf_apply_report.json)",
+    )
+
+    editor_check_parser = subparsers.add_parser(
+        "wolf-editor-check",
+        help="inspect an explicit/configured/project-adjacent WOLF Editor candidate",
+    )
+    editor_check_parser.add_argument("editor", type=Path, nargs="?")
+    editor_check_parser.add_argument(
+        "--project", type=Path, help="optional WOLF project root for adjacent evidence"
+    )
+    editor_check_parser.add_argument(
+        "--report",
+        type=Path,
+        default=Path("reports/wolf_editor_check.json"),
+        help="portable detection report",
+    )
+
+    editor_validate_parser = subparsers.add_parser(
+        "wolf-editor-validate",
+        help="validate official Editor Text I/O in an isolated project copy",
+    )
+    editor_validate_parser.add_argument("project_directory", type=Path)
+    editor_validate_parser.add_argument(
+        "--editor", type=Path, help="explicit Editor.exe/EditorPro.exe path"
+    )
+    editor_validate_parser.add_argument(
+        "--target", choices=("ALL", "BASIC", "MAP"), default="ALL"
+    )
+    editor_validate_parser.add_argument(
+        "--allow-editor-import",
+        action="store_true",
+        help="explicitly allow -txtinput only inside isolated copies",
+    )
+    editor_validate_parser.add_argument(
+        "--workspace", type=Path, help="new external integration workspace"
+    )
+    editor_validate_parser.add_argument(
+        "--keep-workspace",
+        action="store_true",
+        help="preserve the isolated workspace for inspection",
+    )
+    editor_validate_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_EDITOR_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=f"per-process timeout, 1-{MAX_EDITOR_TIMEOUT_SECONDS} seconds",
+    )
+    editor_validate_parser.add_argument(
+        "--report",
+        type=Path,
+        default=Path("reports/wolf_editor_integration.json"),
+        help="portable integration report",
     )
 
     font_check_parser = subparsers.add_parser(
@@ -744,6 +804,130 @@ def _handle_wolf_text_apply(args: argparse.Namespace, logger: logging.Logger) ->
     return 3 if report.errors or report.blockers else 0
 
 
+def _runtime_path(path: Path) -> Path:
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    return candidate.resolve()
+
+
+def _print_wolf_editor_detection(detection: WolfEditorDetection) -> None:
+    print("WOLF Editor Availability")
+    print(f"Detected: {'yes' if detection.detected else 'no'}")
+    print(f"Editor file: {detection.editor_file or '-'}")
+    print(f"Editor version: {detection.editor_version or 'NOT VERIFIED'}")
+    print(f"Version source: {detection.version_source}")
+    print(f"Provenance: {detection.provenance}")
+    print("Evidence:")
+    for evidence in detection.evidence:
+        print(f"- {evidence}")
+    if not detection.evidence:
+        print("- none")
+
+
+def _handle_wolf_editor_check(
+    args: argparse.Namespace, logger: logging.Logger
+) -> int:
+    try:
+        project = (
+            resolve_input_directory(args.project) if args.project is not None else None
+        )
+        editor = _runtime_path(args.editor) if args.editor is not None else None
+        report_file = resolve_output_file(args.report)
+        if report_file.suffix.casefold() != ".json":
+            raise ValueError("WOLF Editor check report must use the .json extension")
+        if project is not None and (
+            report_file == project or report_file.is_relative_to(project)
+        ):
+            raise ValueError("Editor check report cannot be inside the project")
+        adapter = create_engine_registry().adapter_for(EngineId.WOLF_RPG_EDITOR)
+        if adapter is None:
+            raise RuntimeError("WOLF adapter is not registered")
+        detection = adapter.check_editor(editor, project=project)
+        write_wolf_editor_report(report_file, detection)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        return 2
+    for issue in detection.issues:
+        (logger.warning if issue.severity == "warning" else logger.error)(
+            "%s: %s", issue.code, issue.reason
+        )
+    _print_wolf_editor_detection(detection)
+    print(f"Report: {report_file}")
+    return 0 if detection.detected else 3
+
+
+def _handle_wolf_editor_validate(
+    args: argparse.Namespace, logger: logging.Logger
+) -> int:
+    try:
+        project = resolve_input_directory(args.project_directory)
+        editor = _runtime_path(args.editor) if args.editor is not None else None
+        workspace = (
+            resolve_new_directory(args.workspace)
+            if args.workspace is not None
+            else None
+        )
+        report_file = resolve_output_file(args.report)
+        if report_file.suffix.casefold() != ".json":
+            raise ValueError("WOLF Editor integration report must use .json")
+        if report_file == project or report_file.is_relative_to(project):
+            raise ValueError("integration report cannot be inside the original project")
+        if workspace is not None and (
+            report_file == workspace or report_file.is_relative_to(workspace)
+        ):
+            raise ValueError("integration report cannot be inside the workspace")
+        adapter = create_engine_registry().adapter_for(EngineId.WOLF_RPG_EDITOR)
+        if adapter is None:
+            raise RuntimeError("WOLF adapter is not registered")
+        result = adapter.validate_editor_integration(
+            project,
+            editor=editor,
+            target=args.target,
+            allow_editor_import=args.allow_editor_import,
+            workspace=workspace,
+            keep_workspace=args.keep_workspace,
+            timeout_seconds=args.timeout,
+        )
+        if not isinstance(result, WolfEditorIntegrationResult):
+            raise RuntimeError("WOLF adapter returned an invalid integration result")
+        write_wolf_editor_report(report_file, result.report)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        return 2
+
+    report = result.report
+    for issue in report.issues:
+        (logger.warning if issue.severity == "warning" else logger.error)(
+            "%s: %s", issue.code, issue.reason
+        )
+    print("WOLF Editor Integration Validation")
+    print(f"Official verification: {report.official_verification}")
+    print(f"Editor detected: {'yes' if report.editor_detected else 'no'}")
+    print(f"Editor version: {report.editor_version or 'NOT VERIFIED'}")
+    print(f"Fixture kind: {report.fixture_kind}")
+    print(f"Target: {report.target}")
+    print(f"Editor import opt-in: {'yes' if report.allow_editor_import else 'no'}")
+    print(f"txtoutput: {'success' if report.txtoutput_success else 'not verified'}")
+    print(f"txtinput: {report.txtinput_success if report.txtinput_success is not None else 'NOT RUN'}")
+    print(f"re-export: {report.reexport_success if report.reexport_success is not None else 'NOT RUN'}")
+    print(f"Korean round-trip: {report.korean_roundtrip}")
+    print(f"COMMA round-trip: {report.comma_roundtrip}")
+    print(f"Choice: {report.choice_validation.get('status', 'NOT VERIFIED')}")
+    print(f"Database: {report.database_validation.get('status', 'NOT VERIFIED')}")
+    print(f"Warnings: {report.warnings}")
+    print(f"Errors: {report.errors}")
+    print(f"Blockers: {report.blockers}")
+    if result.workspace_preserved and result.workspace is not None:
+        print(f"Workspace preserved: {result.workspace}")
+    print(f"Report: {report_file}")
+    if report.errors or report.blockers:
+        return 3
+    if args.allow_editor_import and report.official_verification != "VERIFIED":
+        return 3
+    return 0
+
+
 def _handle_font(args: argparse.Namespace, logger: logging.Logger) -> int:
     try:
         game_directory = resolve_input_directory(args.game_directory)
@@ -906,6 +1090,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "wolf-text-apply":
         return _handle_wolf_text_apply(args, logger)
+
+    if args.command == "wolf-editor-check":
+        return _handle_wolf_editor_check(args, logger)
+
+    if args.command == "wolf-editor-validate":
+        return _handle_wolf_editor_validate(args, logger)
 
     if args.command in {"font-check", "font-patch"}:
         return _handle_font(args, logger)

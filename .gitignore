@@ -31,6 +31,9 @@ outputs/
 staging/
 temp/
 tmp/
+integration-workspaces/
+wolf-editor-integration/
+.glt-wolf-editor-*/
 
 # Root-level extracted/translated JSONL files are local working data. Synthetic
 # fixtures under tests/ remain trackable when they are deliberately added.

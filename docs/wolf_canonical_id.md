@@ -100,5 +100,13 @@ row ordinal이라는 점은 reorder/insert/delete에 취약하며, 검증되지 
 0.7.4 source fingerprint는 다른 게임/version 오적용을 막는 preflight 정보이며
 canonical ID 구성요소가 아니다. native `.dat`/`.mps` parser와 Text I/O route가 동일
 object를 가리킨다는 cross-route 검증 후 v2를 별도로 제안한다.
+
+## GLT 0.7.5 review
+
+Official Editor integration report는 v1 ID를 기준으로 txtoutput/import/re-export record를
+비교할 수 있게 되었지만 현재 환경에는 실제 Editor fixture가 없어 cross-route evidence를
+확보하지 못했다. Choice는 experimental, DB row ordinal 위험은 그대로다. 따라서
+`wolf:v1`, `schema_status=provisional`, `decision=keep v1`을 유지하며 v2 proposal은
+실제 official fixture 및 native parser evidence 이후 재평가한다.
 native parser, repeated official export와 DB reorder 안정성을 확인한 뒤 v1 유지 또는
 새 `v2` 도입을 결정한다.

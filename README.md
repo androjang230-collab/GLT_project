@@ -1,7 +1,7 @@
 # Game Localization Toolkit (GLT)
 
 Windows 11에서 일본 동인게임의 번역 가능한 문자열을 안전하게 다루기 위한
-개인용 Python 도구입니다. 현재 버전은 **GLT 0.7.4**이며 RPG Maker MV/MZ의
+개인용 Python 도구입니다. 현재 버전은 **GLT 0.7.5**이며 RPG Maker MV/MZ의
 엔진 감지, UTF-8 JSONL 추출, 별도 폴더 안전 적용, 독립 QA, dry-run,
 fingerprint와 이식 가능한 번역 Project, 사용자 Glossary 및 JSONL Translation
 Memory, 폰트 진단과 안전한 기본 폰트 패치를 구현합니다. 대용량 번역 JSONL은
@@ -319,7 +319,7 @@ Game_KR/
 {
   "project_version": 1,
   "schema_version": 1,
-  "tool_version": "0.7.4",
+  "tool_version": "0.7.5",
   "engine": "rpgmaker_mz",
   "game_fingerprint": "<sha256>",
   "source_file": "source.jsonl",
@@ -817,3 +817,40 @@ Choice와 marker 없는 `DATATYPE_n` DB text cell은 계속 experimental이며 J
 대상이 아닙니다. `wolf:v1` canonical schema도 native parser cross-route 검증 전까지
 `provisional`입니다. `Editor.exe -txtinput`, native `.dat`/`.mps`, `.wolf`/`.wolfx`
 수정은 구현하지 않았습니다.
+
+## 0.7.5 WOLF Official Editor Integration Validation
+
+0.7.5는 공식 WOLF Editor Text I/O CLI를 격리된 test-project 복사본에서 검증할 수
+있는 opt-in integration layer를 제공합니다. 현재 개발 환경에는 실제 Editor가 없어
+official integration 결과는 **NOT VERIFIED**이며, synthetic subprocess emulator 결과는
+절대로 official evidence로 승격되지 않습니다.
+
+```powershell
+python glt.py wolf-editor-check "D:\WolfEditor\Editor.exe" `
+  --project "D:\WolfTestProject" `
+  --report "reports\wolf_editor_check.json"
+
+# 기본 inspect mode: isolated copy에서 txtoutput과 GLT no-op 계획까지만 수행
+python glt.py wolf-editor-validate "D:\WolfTestProject" `
+  --editor "D:\WolfEditor\Editor.exe" `
+  --target ALL `
+  --report "reports\wolf_editor_integration.json"
+
+# txtinput은 이 명시적 opt-in이 있을 때만 isolated copies에서 실행
+python glt.py wolf-editor-validate "D:\WolfTestProject" `
+  --editor "D:\WolfEditor\Editor.exe" `
+  --target ALL `
+  --allow-editor-import `
+  --keep-workspace `
+  --report "reports\wolf_editor_integration.json"
+```
+
+Editor 검색 범위는 explicit path, `GLT_WOLF_EDITOR`, project root의 `Editor.exe` 또는
+`EditorPro.exe`뿐입니다. system-wide 검색은 하지 않습니다. 후보는 filename만 보지
+않고 regular file, `.exe`, PE `MZ` signature와 project evidence를 함께 확인합니다.
+
+실행은 `shell=False`, argument list, working directory, timeout, captured output 및
+exit-code 기록을 사용합니다. report의 command/path는 portable form이며 stdout/stderr
+내용은 저장하지 않고 크기와 SHA-256만 기록합니다. 원본 project와 Editor는 실행하지
+않고 외부 workspace의 복사본만 사용합니다. 자세한 정책과 현재 검증 상태는
+[WOLF Editor integration](docs/wolf_editor_integration.md)에 정리했습니다.
