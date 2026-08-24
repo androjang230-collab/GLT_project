@@ -1,4 +1,4 @@
-# WOLF official fixture validation and extraction policy (GLT 0.7.3)
+# WOLF official fixture validation and extraction policy (through GLT 0.7.6)
 
 이 문서는 `.Auto.txt` record를 공통 GLT JSONL에 포함할 수 있는지 결정한 근거를
 정리한다. `Verified`, `Observed`, `Experimental`, `Unknown`은 포맷 전체의
@@ -28,6 +28,9 @@
   함께 나타났다. `DATATYPE_n`의 2000 계열과 string field의 관계도 관찰했다.
 - 공식 개발 블로그는 실제 개발 프로젝트에서도 `CommonEvent.Auto.txt`,
   `DataBase.Auto.txt`, `CDataBase.Auto.txt`가 생성된다고 설명한다.
+- GLT 0.7.6 local official Editor 3.682 export에서 code 101 message 250개와 code 102
+  choice option 43개를 관찰하고 isolated import/re-export로 정확한 위치와 순서를
+  확인했다. 실제 fixture text/binary는 repository에 포함하지 않는다.
 
 ### Synthetic
 
@@ -38,10 +41,11 @@ encoding, whitespace, collision을 검증하는 최소 자체 문자열만 사�
 
 | Record | Evidence tier | GLT classification | Default JSONL |
 |---|---|---|---|
-| code 101, string slot 0 | Observed in public Editor export | `VERIFIED_TRANSLATABLE` | Include |
+| code 101, string slot 0 | Local official Editor export/import/re-export | `VERIFIED_TRANSLATABLE` | Include |
 | code 101, extra slot | Experimental | `EXPERIMENTAL_TRANSLATABLE` | Exclude |
 | label-only message with other code | Experimental | `EXPERIMENTAL_TRANSLATABLE` | Exclude |
-| choice label/literals | Experimental | `EXPERIMENTAL_TRANSLATABLE` | Exclude |
+| code 102 option literals | Local official Editor export/import/re-export | `VERIFIED_TRANSLATABLE` | Include |
+| label-only choice with other code | Experimental | `EXPERIMENTAL_TRANSLATABLE` | Exclude |
 | DATANAME marker value | Official marker + observed structure | `VERIFIED_TRANSLATABLE` | Include |
 | DATATYPE 2000-series cell | Observed, field semantics incomplete | `EXPERIMENTAL_TRANSLATABLE` | Exclude |
 | approved Game title fields | Observed explicit player-facing keys | `VERIFIED_TRANSLATABLE` | Include |
@@ -60,10 +64,12 @@ record로 남긴다.
 
 ## Choice
 
-공식 도움말은 choice command, branch, cancel/default 동작을 설명하지만 현재 확보한
-`.Auto.txt` fixture에서 declaration과 labels, branch index, nested/cancel/default의
-raw 관계를 안정적으로 재구성하지 못했다. 따라서 parser inspection에는 후보를
-남기되 JSONL에는 포함하지 않는다.
+실제 3.682 sample export에서 code 102 선언과 option literal 순서, code 401 branch 및
+code 499 end가 관찰되었다. 한국어 localized human label과 무관하게 code 102 literal을
+선택지로 판정하며 `command_index`/`text_index`로 각 option을 식별한다. GLT writer는
+option literal만 변경하고 branch/end command를 보존했으며 official Editor
+import/re-export도 통과했다. 다만 cancel/default parameter의 의미는 확정하지 않았고
+branch/end record 자체는 번역 대상으로 추출하지 않는다.
 
 ## Database
 

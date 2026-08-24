@@ -176,6 +176,12 @@ def to_translation_entry(
     command_code = record.metadata.get("command_code")
     if command_code is not None:
         metadata["command_code"] = command_code
+    command_indent = record.metadata.get("command_indent")
+    if command_indent is not None:
+        metadata["command_indent"] = command_indent
+    option_index = record.metadata.get("option_index")
+    if option_index is not None:
+        metadata["option_index"] = option_index
     if source_fingerprint is not None:
         metadata["source_fingerprint"] = source_fingerprint
     if source_file_sha256 is not None:
@@ -267,7 +273,7 @@ def _build_report(
         output_ids=tuple(entry.id for entry in entries),
         notes=(
             "Only VERIFIED_TRANSLATABLE records are included.",
-            "Choice and label-only message candidates remain experimental and excluded.",
+            "WOLF command 102 option literals are verified from a local official Editor 3.682 export; label-only message candidates remain experimental.",
             "WOLF canonical location schema v1 remains provisional.",
         ),
         source_fingerprint=source_fingerprint,

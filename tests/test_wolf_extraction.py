@@ -145,9 +145,9 @@ class WolfPhaseFourExtractionTests(unittest.TestCase):
         self.assertEqual([], result.entries)
         self.assertEqual(1, result.report.experimental_excluded)
 
-    def test_choice_candidate_is_experimental_and_excluded(self) -> None:
+    def test_code_102_choice_is_verified_without_localized_label_dependency(self) -> None:
         text = _event_export(
-            commands=((102, ("はい", "いいえ"), "■選択肢：表示"),)
+            commands=((102, ("예", "아니요"), "■문장 선택지:/ 【1】예/ 【2】아니요"),)
         )
         _write(self.export / "MapData/Map001.mps.Auto.txt", text)
 
@@ -157,12 +157,17 @@ class WolfPhaseFourExtractionTests(unittest.TestCase):
         self.assertTrue(
             all(
                 record.classification
-                == WolfRecordClassification.EXPERIMENTAL_TRANSLATABLE
+                == WolfRecordClassification.VERIFIED_TRANSLATABLE
                 for record in inspection.records
             )
         )
-        self.assertEqual(0, result.report.output_entries)
-        self.assertEqual(2, result.report.experimental_excluded)
+        self.assertEqual(["예", "아니요"], [entry.original for entry in result.entries])
+        self.assertEqual(
+            [0, 1],
+            [entry.extra_metadata["option_index"] for entry in result.entries],
+        )
+        self.assertEqual(2, result.report.output_entries)
+        self.assertEqual(0, result.report.experimental_excluded)
 
     def test_dataname_is_extracted_but_markerless_description_is_not(self) -> None:
         _write(
@@ -284,7 +289,7 @@ class WolfPhaseFourExtractionTests(unittest.TestCase):
     def test_converter_rejects_experimental_record(self) -> None:
         _write(
             self.export / "MapData/Map001.mps.Auto.txt",
-            _event_export(commands=((102, ("choice",), "■選択肢：表示"),)),
+            _event_export(commands=((103, ("label only",), "■文章：見本"),)),
         )
         record = WolfTextInspector().inspect(self.export).records[0]
         with self.assertRaisesRegex(ValueError, "only verified"):
@@ -340,10 +345,10 @@ class WolfPhaseFourExtractionTests(unittest.TestCase):
         payload = json.loads(path.read_text(encoding="utf-8"))
 
         self.assertEqual(1, payload["files_scanned"])
-        self.assertEqual(1, payload["verified_translatable"])
-        self.assertEqual(1, payload["experimental_excluded"])
+        self.assertEqual(2, payload["verified_translatable"])
+        self.assertEqual(0, payload["experimental_excluded"])
         self.assertEqual(1, payload["unknown_records"])
-        self.assertEqual(1, payload["output_entries"])
+        self.assertEqual(2, payload["output_entries"])
         self.assertNotIn(str(self.export), path.read_text(encoding="utf-8"))
         with self.assertRaises(FileExistsError):
             write_wolf_extraction_report(path, result.report)

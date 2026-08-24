@@ -14,18 +14,18 @@
 - 공식 database 설명: https://silversecond.com/WolfRPGEditor/Help/04ev_db.html
 
 Fixture provenance 값은 `synthetic`, `official_export`,
-`self_generated_official_export`, `public_repository_observed`를 구분한다. 현재 실행
-환경에는 WOLF Editor가 없어 repository에 self-generated official fixture를 만들지
-못했다. 실제 게임 저작권 문장도 fixture로 포함하지 않았다. 환경 변수
+`self_generated_official_export`, `public_repository_observed`를 구분한다. 0.7.6에서
+local official Editor 3.682 sample을 격리 실행했지만 실제 game binary/text는
+repository에 포함하지 않는다. 환경 변수
 `GLT_WOLF_AUTOTXT_FIXTURE`로 사용자가 제공한 official export에 대해 선택적 read-only
 integration regression을 실행할 수 있다.
 
 ## Choice and database decision
 
-공식 export로 choice declaration, label/index, branch, cancel/default, nested choice와
-command order 전체를 교차 확인할 fixture가 없으므로 choice는
-`EXPERIMENTAL_TRANSLATABLE` 상태를 유지한다. branch/cancel/default record는 추출하거나
-writer로 수정하지 않는다.
+실제 3.682 export에서 code 102 declaration/option order, code 401 branch, code 499 end와
+nested indent를 관찰했다. option literal은 GLT writer와 official import/re-export를
+통과해 `VERIFIED_TRANSLATABLE`로 승격했다. branch/end record는 추출하거나 수정하지
+않으며 cancel/default parameter 의미는 계속 미검증이다.
 
 DB writer allowlist는 `VERIFIED_DATABASE_TEXT_FIELDS = {"dataname"}`이다. 공식 marker
 `<<!--DATANAME--!>>` 뒤의 player-visible name만 verified이다. `DATATYPE_n >= 2000`
@@ -86,7 +86,7 @@ translated/applicable/applied/skipped, modified/untouched files 및 모든 issue
 
 ## Known limitations
 
-- official/self-generated choice/nested/cancel/default fixture 검증은 아직 없다.
+- code 102 option과 nested 구조는 부분 검증했지만 cancel/default 의미는 미검증이다.
 - DATANAME 외 DB field는 writer 대상이 아니다.
 - canonical v1 DB row ordinal은 reorder에 안정적이지 않다.
 - 실제 newline을 포함하는 번역은 multiline source syntax가 확인될 때까지 차단한다.

@@ -24,6 +24,21 @@ def write_dry_run_report(reports_directory: Path, report: ApplyReport) -> Path:
     return report_file
 
 
+def write_apply_report(reports_directory: Path, report: ApplyReport) -> Path:
+    """Atomically write the portable report for a completed Project apply."""
+
+    reports_directory.mkdir(parents=True, exist_ok=True)
+    report_file = reports_directory / "apply_report.json"
+    payload = {
+        "tool_version": TOOL_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "dry_run": False,
+        **report.to_json_dict(),
+    }
+    _write_json_atomic(report_file, payload)
+    return report_file
+
+
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None

@@ -7,6 +7,11 @@ from engines.wolf.text_extractor import WolfExtractionReport, WolfTextExtractor
 from engines.wolf.text_models import WolfLocation, WolfTextReport
 from engines.wolf.text_qa import WolfQaReport, WolfTextQa
 from engines.wolf.text_writer import WolfTextWriter, WolfWriteReport
+from engines.wolf.editor_integration import (
+    WolfEditorDetection,
+    WolfEditorIntegrationReport,
+    WolfEditorIntegrationValidator,
+)
 
 __all__ = [
     "WolfArchiveProbe",
@@ -20,4 +25,7 @@ __all__ = [
     "WolfQaReport",
     "WolfTextWriter",
     "WolfWriteReport",
+    "WolfEditorDetection",
+    "WolfEditorIntegrationReport",
+    "WolfEditorIntegrationValidator",
 ]

@@ -176,6 +176,7 @@ class ApplyReport:
     issues: list[ApplyIssue] = field(default_factory=list)
     planned_files: list[str] = field(default_factory=list)
     planned_ids: list[str] = field(default_factory=list)
+    extra_metadata: dict[str, object] = field(default_factory=dict)
 
     @property
     def warnings(self) -> int:
@@ -190,7 +191,7 @@ class ApplyReport:
         return sum(issue.severity == "conflict" for issue in self.issues)
 
     def to_json_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "engine": self.engine.value,
             "files_copied": self.files_copied,
             "json_files_modified": len(self.modified_files),
@@ -208,3 +209,10 @@ class ApplyReport:
             "planned_ids": self.planned_ids,
             "issues": [issue.to_json_dict() for issue in self.issues],
         }
+        collisions = set(payload) & set(self.extra_metadata)
+        if collisions:
+            raise ValueError(
+                f"apply report metadata conflicts with standard fields: {sorted(collisions)!r}"
+            )
+        payload.update(self.extra_metadata)
+        return payload

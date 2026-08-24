@@ -27,6 +27,7 @@ MAX_UNKNOWN_RECORDS = 1_000
 _SECTION_RE = re.compile(r"^\[([A-Z0-9_ -]+)\]$")
 _KEY_VALUE_RE = re.compile(r"^([A-Z0-9_\[\]-]+)=(.*)$")
 _RAW_COMMAND_RE = re.compile(r"^\[(\d+)\]")
+_RAW_COMMAND_INDENT_RE = re.compile(r"^\[\d+\]\[[^\]]*\]<(\d+)>")
 _CONTROL_TOKEN_RE = re.compile(
     r"\\[A-Za-z]+(?:\[[^\]\r\n]*\])?|<<[^<>\r\n]+>>"
 )
@@ -574,6 +575,10 @@ def _parse_event_commands(
         for command_index, (line_number, raw_command) in enumerate(raw_commands):
             code_match = _RAW_COMMAND_RE.match(raw_command)
             code = code_match.group(1) if code_match is not None else "unknown"
+            indent_match = _RAW_COMMAND_INDENT_RE.match(raw_command)
+            command_indent = (
+                int(indent_match.group(1)) if indent_match is not None else None
+            )
             label = (
                 human_commands[command_index][1]
                 if command_index < len(human_commands)
@@ -632,9 +637,11 @@ def _parse_event_commands(
                         },
                         metadata={
                             "command_code": code,
+                            "command_indent": command_indent,
+                            "option_index": text_index if code == "102" else None,
                             "string_representation": "auto_txt_raw_literal",
                             "confidence": (
-                                "public_repository_observed"
+                                "self_generated_or_local_official_export_observed"
                                 if slot_classification
                                 == WolfRecordClassification.VERIFIED_TRANSLATABLE
                                 else "experimental"
@@ -809,6 +816,11 @@ def _event_record_type(
     visible = label[label.find("■") :] if "■" in label else label
     if code == "101":
         return "dialogue", WolfRecordClassification.VERIFIED_TRANSLATABLE
+    if code == "102":
+        # WOLF Editor 3.682 local official export evidence confirms that every
+        # string literal is one displayed option, in source order.  Depending
+        # on a localized COMMAND_TEXT label made Korean Editor exports vanish.
+        return "choice", WolfRecordClassification.VERIFIED_TRANSLATABLE
     if visible.startswith(("■文章:", "■文章：")):
         return "dialogue", WolfRecordClassification.EXPERIMENTAL_TRANSLATABLE
     if (
