@@ -1,12 +1,15 @@
-# WOLF Official Editor integration validation (GLT 0.7.5)
+# WOLF Official Editor integration validation (GLT 0.7.6)
 
 ## Current verification status
 
-**NOT VERIFIED.** 0.7.5 개발 환경에는 실제 `Editor.exe`/`EditorPro.exe`가 없었고,
-`GLT_WOLF_EDITOR`도 설정되지 않았다. 따라서 실제 official export, import, re-export,
-한국어 encoding, `<<COMMA>>`, Choice 또는 DB description/help에 대해 성공을 주장하지
-않는다. Unit test의 synthetic invoker는 safety/orchestration regression만 검증하며
-`fixture_kind=synthetic`으로 기록되어 official evidence가 될 수 없다.
+0.7.6 local validation에서 WOLF Editor 3.682 official sample의 격리 복사본을 사용한
+`target=ALL` pipeline이 **VERIFIED**되었다. 실제 export/import/re-export, GLT no-op,
+한국어 UTF-8 source/BOM/no-BOM, code 102 Choice option과 DATANAME `<<COMMA>>`를
+검증했다. Choice cancel/default와 DATANAME 외 DB field, CP932→Korean은 여전히
+미검증이다. Synthetic invoker는 계속 official evidence가 될 수 없다.
+
+실제 수치와 hash는 [0.7.6 real Editor validation](wolf_editor_real_validation_0.7.6.md)에
+개인 절대경로나 game text 없이 기록한다.
 
 ## Official CLI contract
 
@@ -49,7 +52,8 @@ top-level Editor/DLL runtime files만 복사한다. 모든 `txtoutput`/`txtinput
 working directory로 사용한다.
 
 - `shell=False`와 argument list 사용
-- stdout/stderr capture, 내용 대신 byte count/SHA-256 기록
+- stdout/stderr는 anonymous PIPE가 아닌 임시 파일로 capture하고 내용 대신 byte
+  count/SHA-256만 기록
 - exit code와 실행 시간 기록
 - per-process timeout, retry 없음
 - output folder 존재 여부 검사
@@ -80,9 +84,11 @@ Editor normalization이 있으면 semantic equality와 byte equality를 구분�
 
 ## Korean and COMMA trials
 
-각 trial은 verified extraction entry만 대상으로 test translation을 만든다. Control token
-순서와 parameter는 0.7.4 QA로 그대로 보호한다. DATANAME에는 `검, 대형`을 사용하고
-writer가 `검<<COMMA>> 대형`으로 source 표현하도록 한다.
+각 trial은 verified extraction entry 중 최대 3개(dialogue/control, Choice, DATANAME)를
+결정적으로 선택한다. 다른 수백/수천 entry는 빈 translation으로 유지한다. Control token
+순서와 parameter는 0.7.4 QA로 그대로 보호한다. 일반 record에는
+`GLT 0.7.6 한국어 왕복 테스트입니다.`, DATANAME에는 `검, 대형`을 사용하고 writer가
+`검<<COMMA>> 대형`으로 source 표현하도록 한다.
 
 Trial 결과는 `accepted`, `rejected`, `corrupted`, `normalized`, `unknown`으로 기록한다.
 CP932 source-preserving writer가 한글을 encode하지 못하면 기존 정책대로 Editor 실행 전에
@@ -93,10 +99,12 @@ official Korean result가 `VERIFIED`가 된다.
 
 ## Choice, DB, and canonical ID
 
-실제 Editor fixture가 없으므로 Choice declaration/options/branch/cancel/default/nested
-구조는 계속 `NOT VERIFIED`이며 `EXPERIMENTAL_TRANSLATABLE` 상태다. DB allowlist는
-`dataname`만 유지하고 description/help/display field를 추가하지 않았다. DB add/delete/
-reorder native experiment도 `NOT RUN`이다.
+실제 export에서 code 102 선언 15개, option 43개, indent가 있는 nested option을
+관찰했다. option literal 순서와 위치, branch control 비변경 및 Editor 재수출은
+`PARTIALLY VERIFIED`되었고 code 102 option은 `VERIFIED_TRANSLATABLE`로 승격했다.
+cancel/default 의미는 여전히 검증하지 않았다. DB allowlist는 `dataname`만 유지하고
+description/help/display field를 추가하지 않았다. DB add/delete/reorder native
+experiment도 `NOT RUN`이다.
 
 Canonical ID는 `wolf:v1`, `schema_status=provisional`을 유지한다. Native `.dat`/`.mps`
 cross-route identity가 검증되기 전에는 final/stable로 승격하지 않는다.

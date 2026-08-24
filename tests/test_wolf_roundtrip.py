@@ -194,6 +194,38 @@ class WolfRoundTripTests(unittest.TestCase):
         self.assertEqual(1, report.applied_entries)
         self.assertEqual(before, self.map_file.read_bytes())
 
+    def test_choice_translation_changes_only_code_102_option_literal(self) -> None:
+        text = _event("원문").replace(
+            '[101][0,1]<0>()("원문")',
+            "\n".join(
+                [
+                    '[102][1,2]<0>(50)("예","아니요")',
+                    '[401][1,0]<0>(2)()',
+                    '[401][1,0]<0>(3)()',
+                    '[499][0,0]<0>()()',
+                ]
+            ),
+        ).replace("COMMAND_NUM=2", "COMMAND_NUM=5")
+        self._write(text)
+        choices = [
+            entry
+            for entry in WolfTextExtractor().inspect_and_convert(self.source).entries
+            if entry.type == "choice"
+        ]
+        translated = self._jsonl({choices[0].id: "네"})
+        output = self.root / "choice_output"
+
+        report = WolfTextWriter().apply(self.source, translated, output)
+
+        self.assertEqual(1, report.applied_entries)
+        output_text = (output / "MapData/Map001.mps.Auto.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('[102][1,2]<0>(50)("네","아니요")', output_text)
+        self.assertIn('[401][1,0]<0>(2)()', output_text)
+        self.assertIn('[401][1,0]<0>(3)()', output_text)
+        self.assertIn('[499][0,0]<0>()()', output_text)
+
     def test_quote_backslash_tab_and_final_newline_preserved(self) -> None:
         self._write(_event(r"原文\path").rstrip("\n"))
         entry = WolfTextExtractor().inspect_and_convert(self.source).entries[0]

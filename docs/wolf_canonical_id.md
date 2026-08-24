@@ -110,3 +110,12 @@ Official Editor integration report는 v1 ID를 기준으로 txtoutput/import/re-
 실제 official fixture 및 native parser evidence 이후 재평가한다.
 native parser, repeated official export와 DB reorder 안정성을 확인한 뒤 v1 유지 또는
 새 `v2` 도입을 결정한다.
+
+## GLT 0.7.6 review
+
+실제 Editor 3.682 sample에서 MAP/BASIC의 repeated export, no-op import/re-export와
+code 101/102 위치를 검증했다. code 102 option은 기존 v1 `command`/`text` component로
+충돌 없이 식별되었고 별도 ID 계산 변경은 필요하지 않았다. 그러나 native `.dat`/`.mps`
+object와의 cross-route identity, DB row의 stable native key, insert/delete/reorder는
+검증하지 않았다. 따라서 `wolf:v1`과 `schema_status=provisional`을 유지하고 v1을
+조용히 final로 승격하지 않는다.

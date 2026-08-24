@@ -174,6 +174,9 @@ class WolfEditorIntegrationTests(unittest.TestCase):
         self.assertEqual(str(self.editor), args[0][0])
         self.assertEqual(["-txtoutput", "-txt_folder", "Export", "-target", "ALL"], args[0][1:])
         self.assertFalse(kwargs["shell"])
+        self.assertNotIn("capture_output", kwargs)
+        self.assertTrue(hasattr(kwargs["stdout"], "read"))
+        self.assertTrue(hasattr(kwargs["stderr"], "read"))
         self.assertNotIn("-wait", args[0])
         self.assertTrue(result.success)
 
@@ -245,6 +248,24 @@ class WolfEditorIntegrationTests(unittest.TestCase):
         self.assertIn(trials["utf8_bom"].status, {"accepted", "normalized"})
         self.assertEqual("rejected", trials["utf8_no_bom"].status)
         self.assertIn("TEXT_ENCODING_AMBIGUOUS", trials["utf8_no_bom"].reason)
+        self.assertLessEqual(trials["utf8_bom"].translated_entry_count, 3)
+        self.assertIn("choice", trials["utf8_bom"].translated_entry_types)
+        self.assertTrue(trials["utf8_bom"].control_codes_preserved)
+        self.assertFalse(trials["utf8_bom"].mojibake_found)
+        trial_rows = [
+            json.loads(line)
+            for line in (workspace / "utf8_bom.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        translated_rows = [row for row in trial_rows if row["translation"].strip()]
+        self.assertLessEqual(len(translated_rows), 3)
+        self.assertTrue(
+            any(
+                "GLT 0.7.6 한국어 왕복 테스트입니다." in row["translation"]
+                for row in translated_rows
+            )
+        )
         self.assertEqual("NOT VERIFIED", report.korean_roundtrip)
         self.assertEqual("NOT VERIFIED", report.comma_roundtrip)
         self.assertTrue(trials["utf8_bom"].comma_preserved)

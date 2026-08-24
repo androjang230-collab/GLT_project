@@ -27,6 +27,8 @@ WOLF_EDITOR_TARGETS = frozenset({"ALL", "BASIC", "MAP"})
 WOLF_EDITOR_FIXTURE_KIND = "self_generated_official_export"
 DEFAULT_EDITOR_TIMEOUT_SECONDS = 120
 MAX_EDITOR_TIMEOUT_SECONDS = 3600
+MAX_KOREAN_TRIAL_ENTRIES = 3
+KOREAN_ROUNDTRIP_TEXT = "GLT 0.7.6 한국어 왕복 테스트입니다."
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +115,11 @@ class WolfEncodingTrial:
     replacement_character_found: bool | None
     comma_preserved: bool | None
     reason: str
+    translated_entry_count: int = 0
+    translated_entry_types: tuple[str, ...] = ()
+    control_codes_preserved: bool | None = None
+    mojibake_found: bool | None = None
+    choice_preserved: bool | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -128,6 +135,11 @@ class WolfEncodingTrial:
             "replacement_character_found": self.replacement_character_found,
             "comma_preserved": self.comma_preserved,
             "reason": self.reason,
+            "translated_entry_count": self.translated_entry_count,
+            "translated_entry_types": list(self.translated_entry_types),
+            "control_codes_preserved": self.control_codes_preserved,
+            "mojibake_found": self.mojibake_found,
+            "choice_preserved": self.choice_preserved,
         }
 
 
@@ -338,24 +350,36 @@ class SubprocessWolfEditorInvoker:
         timed_out = False
         reason = ""
         try:
-            completed = subprocess.run(
-                command,
-                cwd=working_directory,
-                shell=False,
-                capture_output=True,
-                timeout=timeout_seconds,
-                check=False,
-                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
-            )
-            stdout, stderr = completed.stdout, completed.stderr
-            exit_code = completed.returncode
-            if exit_code != 0:
-                reason = f"Editor exited with code {exit_code}"
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            stdout = exc.stdout or b""
-            stderr = exc.stderr or b""
-            reason = f"Editor exceeded timeout of {timeout_seconds} seconds"
+            # Real Editor 3.682 BASIC/ALL runs can fail to terminate while
+            # Python is waiting on anonymous PIPEs. File-backed capture keeps
+            # the no-console/no-content-reporting policy without that deadlock.
+            with (
+                tempfile.TemporaryFile() as stdout_file,
+                tempfile.TemporaryFile() as stderr_file,
+            ):
+                try:
+                    completed = subprocess.run(
+                        command,
+                        cwd=working_directory,
+                        shell=False,
+                        stdout=stdout_file,
+                        stderr=stderr_file,
+                        timeout=timeout_seconds,
+                        check=False,
+                        creationflags=(
+                            subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                        ),
+                    )
+                    exit_code = completed.returncode
+                    if exit_code != 0:
+                        reason = f"Editor exited with code {exit_code}"
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    reason = f"Editor exceeded timeout of {timeout_seconds} seconds"
+                stdout_file.seek(0)
+                stdout = stdout_file.read()
+                stderr_file.seek(0)
+                stderr = stderr_file.read()
         except OSError as exc:
             reason = f"Editor launch failed: {exc.__class__.__name__}"
         duration_ms = round((time.monotonic() - started) * 1000)
@@ -620,7 +644,9 @@ class WolfEditorIntegrationValidator:
             comma_status = _aggregate_comma_status(
                 trials, baseline_summary, self.invoker.provenance
             )
-            choice_validation = _choice_validation(baseline, self.invoker.provenance, editor_noop)
+            choice_validation = _choice_validation(
+                baseline, self.invoker.provenance, editor_noop, trials
+            )
             database_validation = _database_validation(baseline, self.invoker.provenance, comma_status)
             official = _official_verification_status(
                 self.invoker.provenance,
@@ -731,6 +757,16 @@ def _export_summary(export: Path, fixture_kind: str) -> dict[str, object]:
     inspection = WolfTextInspector().inspect(export, fixture_kind=fixture_kind)
     extraction = WolfTextExtractor().inspect_and_convert(export)
     fingerprint = calculate_wolf_source_fingerprint(export)
+    command_101 = [
+        record
+        for record in inspection.records
+        if record.metadata.get("command_code") == "101"
+    ]
+    command_102 = [
+        record
+        for record in inspection.records
+        if record.metadata.get("command_code") == "102"
+    ]
     return {
         "fingerprint": fingerprint.value,
         "file_count": fingerprint.files.__len__(),
@@ -746,6 +782,20 @@ def _export_summary(export: Path, fixture_kind: str) -> dict[str, object]:
         "choice_record_count": inspection.count_type("choice"),
         "database_record_count": sum(record.location.domain == "database" for record in inspection.records),
         "database_name_count": inspection.count_type("database_name"),
+        "command_101_record_count": len(command_101),
+        "command_101_verified_count": sum(
+            record.classification.value == "verified_translatable"
+            for record in command_101
+        ),
+        "command_102_option_count": len(command_102),
+        "command_102_nested_option_count": sum(
+            isinstance(record.metadata.get("command_indent"), int)
+            and record.metadata.get("command_indent", 0) > 0
+            for record in command_102
+        ),
+        "control_code_record_count": sum(
+            bool(record.control_codes) for record in inspection.records
+        ),
         "issues": [item.to_json_dict() for item in inspection.issues],
     }
 
@@ -909,8 +959,12 @@ def _run_encoding_trial(
                 WolfEncodingTrial(trial_name, encoding, False, "unknown", None, None, None, None, None, None, None, "no verified entries were available after strict decoding"),
                 (),
             )
+        selected_entries = _select_korean_trial_entries(extraction.entries)
+        expected_by_id = {
+            entry.id: _korean_test_translation(entry) for entry in selected_entries
+        }
         translated_entries = [
-            replace(entry, translation=_korean_test_translation(entry))
+            replace(entry, translation=expected_by_id.get(entry.id, ""))
             for entry in extraction.entries
         ]
         translated_jsonl = workspace / f"{trial_name}.jsonl"
@@ -951,9 +1005,32 @@ def _run_encoding_trial(
         reexport_path = roundtrip["reexport_path"]
         comparison = roundtrip["comparison"]
         output_report = WolfTextInspector().inspect(reexport_path)
-        output_text = "\n".join(record.original for record in output_report.records)
-        korean = "한국어" in output_text or "검" in output_text or "대형" in output_text
+        output_by_id = {record.id: record for record in output_report.records}
+        selected_output = [
+            output_by_id[entry.id]
+            for entry in selected_entries
+            if entry.id in output_by_id
+        ]
+        exact = len(selected_output) == len(selected_entries) and all(
+            _semantic_record_text(output_by_id[entry.id]) == expected_by_id[entry.id]
+            for entry in selected_entries
+        )
+        output_text = "\n".join(
+            _semantic_record_text(record) for record in selected_output
+        )
+        korean = exact and ("한국어" in output_text or "검" in output_text)
         replacement = "\ufffd" in output_text
+        question_replacement = "???" in output_text
+        control_preserved = len(selected_output) == len(selected_entries) and all(
+            tuple(
+                token
+                for token in output_by_id[entry.id].control_codes
+                if token != "<<COMMA>>"
+            )
+            == tuple(token for token in entry.control_codes if token != "<<COMMA>>")
+            for entry in selected_entries
+        )
+        mojibake = replacement or question_replacement or not exact
         comma_expected = any(
             entry.type == "database_name" for entry in translated_entries
         )
@@ -969,9 +1046,22 @@ def _run_encoding_trial(
             if comma_expected
             else None
         )
+        choice_selected = [
+            entry for entry in selected_entries if entry.type == "choice"
+        ]
+        choice_preserved = (
+            all(
+                entry.id in output_by_id
+                and _semantic_record_text(output_by_id[entry.id])
+                == expected_by_id[entry.id]
+                for entry in choice_selected
+            )
+            if choice_selected
+            else None
+        )
         semantic = bool(comparison.get("semantic_equal"))
         byte_equal = bool(comparison.get("byte_equal"))
-        if semantic and korean and not replacement:
+        if semantic and korean and control_preserved and not mojibake:
             status = "accepted" if byte_equal else "normalized"
             reason = "Korean semantic content survived Editor import/re-export"
         else:
@@ -991,6 +1081,11 @@ def _run_encoding_trial(
                 replacement,
                 comma_preserved,
                 reason,
+                len(selected_entries),
+                tuple(entry.type for entry in selected_entries),
+                control_preserved,
+                mojibake,
+                choice_preserved,
             ),
             tuple(roundtrip["invocations"]),
         )
@@ -1022,9 +1117,41 @@ def _korean_test_translation(entry: object) -> str:
     )
     if entry.type == "database_name":
         return "검, 대형" + control_codes
-    if entry.type == "system":
-        return "GLT 한국어 검증" + control_codes
-    return "GLT 한국어 검증" + control_codes
+    return KOREAN_ROUNDTRIP_TEXT + control_codes
+
+
+def _semantic_record_text(record: object) -> str:
+    return (
+        record.normalized_view
+        if record.normalized_view is not None
+        else record.original
+    )
+
+
+def _select_korean_trial_entries(entries: list[object]) -> list[object]:
+    """Choose a few deterministic visible records instead of rewriting a fixture."""
+
+    selected: list[object] = []
+    priorities = (
+        lambda entry: entry.type == "dialogue" and bool(entry.control_codes),
+        lambda entry: entry.type == "choice",
+        lambda entry: entry.type == "database_name",
+        lambda entry: entry.type in {"dialogue", "system"},
+    )
+    for predicate in priorities:
+        match = next(
+            (
+                entry
+                for entry in entries
+                if entry not in selected and predicate(entry)
+            ),
+            None,
+        )
+        if match is not None:
+            selected.append(match)
+        if len(selected) >= MAX_KOREAN_TRIAL_ENTRIES:
+            break
+    return selected
 
 
 def _aggregate_korean_status(
@@ -1059,20 +1186,39 @@ def _choice_validation(
     baseline: Path,
     fixture_kind: str,
     editor_noop: dict[str, object],
+    trials: list[WolfEncodingTrial],
 ) -> dict[str, object]:
     report = WolfTextInspector().inspect(baseline, fixture_kind=fixture_kind)
     count = report.count_type("choice")
     comparison = editor_noop.get("comparison", {})
+    official_roundtrip = (
+        fixture_kind == WOLF_EDITOR_FIXTURE_KIND
+        and bool(comparison.get("semantic_equal"))
+        and any(item.choice_preserved is True for item in trials)
+    )
+    nested = any(
+        record.type == "choice"
+        and isinstance(record.metadata.get("command_indent"), int)
+        and record.metadata.get("command_indent", 0) > 0
+        for record in report.records
+    )
     return {
-        "status": "NOT VERIFIED",
+        "status": "PARTIALLY VERIFIED" if official_roundtrip else "NOT VERIFIED",
         "record_count": count,
         "fixture_kind": fixture_kind,
         "noop_semantic_equal": comparison.get("semantic_equal"),
-        "displayed_option_location_verified": False,
-        "branch_control_separation_verified": False,
+        "command_code": "102" if count else None,
+        "displayed_option_location_verified": official_roundtrip,
+        "option_order_verified": official_roundtrip,
+        "branch_control_separation_verified": official_roundtrip,
+        "nested_structure_observed": nested,
         "nested_cancel_default_verified": False,
-        "classification_changed": False,
-        "reason": "choice translation/write round-trip is not proven by the current verified-only writer",
+        "classification_changed": bool(count),
+        "reason": (
+            "command 102 option literals survived verified-only GLT write and official Editor re-export; cancel/default semantics remain unverified"
+            if official_roundtrip
+            else "choice translation/write round-trip is not proven by the current official fixture"
+        ),
     }
 
 

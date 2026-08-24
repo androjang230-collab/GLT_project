@@ -1,24 +1,23 @@
 # Game Localization Toolkit (GLT)
 
 Windows 11에서 일본 동인게임의 번역 가능한 문자열을 안전하게 다루기 위한
-개인용 Python 도구입니다. 현재 버전은 **GLT 0.7.5**이며 RPG Maker MV/MZ의
+개인용 Python 도구입니다. 현재 버전은 **GLT 0.7.6**이며 RPG Maker MV/MZ의
 엔진 감지, UTF-8 JSONL 추출, 별도 폴더 안전 적용, 독립 QA, dry-run,
 fingerprint와 이식 가능한 번역 Project, 사용자 Glossary 및 JSONL Translation
 Memory, 폰트 진단과 안전한 기본 폰트 패치를 구현합니다. 대용량 번역 JSONL은
 독립 Split/Merge 유틸리티로 나누고 무결성을 검증하며 다시 합칠 수 있습니다.
-WOLF RPG Editor는 실험적 자동 감지, archive 조사, 공식 `.Auto.txt` export의
-read-only 구조 분석과 verified-only 공통 JSONL 추출 prototype을 지원합니다.
+WOLF RPG Editor는 자동 감지, archive 조사, 공식 `.Auto.txt`의 구조 분석·추출·QA·
+안전 적용과 격리된 official Editor Text I/O validation을 지원합니다.
 
 ## 엔진 지원 상태
 
 | Engine | Detect | Inspect | Extract | QA / Apply | Font |
 | --- | --- | --- | --- | --- | --- |
 | RPG Maker MV/MZ | Yes | Not yet | Yes | Yes | Yes |
-| WOLF RPG Editor | Experimental | Experimental | Not yet | Not yet | Not yet |
+| WOLF RPG Editor | Experimental | Yes (`.Auto.txt`) | Yes (`.Auto.txt`) | Yes (`.Auto.txt`) | Not yet |
 
-WOLF 지원은 파일명·디렉터리·크기·제한된 header와 외부 `.Auto.txt` export를
-조사하는 단계입니다. archive 해제, 복호화, Translation JSONL 추출, import 또는
-binary 수정은 수행하지 않습니다.
+WOLF native archive 해제·복호화·binary 직접 수정은 수행하지 않습니다. 공식 Editor
+`-txtinput`은 명시적 opt-in validation에서만 원본 밖 격리 복사본에 실행됩니다.
 
 ## 설계 원칙
 
@@ -854,3 +853,19 @@ exit-code 기록을 사용합니다. report의 command/path는 portable form이�
 내용은 저장하지 않고 크기와 SHA-256만 기록합니다. 원본 project와 Editor는 실행하지
 않고 외부 workspace의 복사본만 사용합니다. 자세한 정책과 현재 검증 상태는
 [WOLF Editor integration](docs/wolf_editor_integration.md)에 정리했습니다.
+
+## 0.7.6 WOLF real Editor validation
+
+WOLF Editor 3.682의 local official sample project를 원본 밖에 복사해 `ALL` Text I/O를
+실행했습니다. 실제 stdout/stderr anonymous pipe가 BASIC/ALL 종료를 방해하는 현상을
+재현하여 file-backed capture로 교체했습니다. 수정 후 baseline export, direct no-op,
+GLT no-op, source UTF-8, UTF-8 BOM, UTF-8 no-BOM의 11개 Editor 호출이 모두 정상
+종료했습니다.
+
+실제 export는 UTF-8(no BOM), CRLF, final newline 형식이었고 Editor re-export도 모두
+그 형식으로 정규화했습니다. 한국어 dialogue, code 102 Choice option, DATANAME을 각
+trial에서 최대 3개만 변경해 exact semantic preservation, control token 보존,
+`<<COMMA>>` transport와 mojibake 부재를 확인했습니다. Choice option은 verified
+추출/writer 대상으로 승격했지만 cancel/default 의미와 native `.dat`/`.mps` cross-route
+ID는 미검증이므로 `wolf:v1`은 계속 `provisional`입니다. Portable evidence는
+[0.7.6 real Editor validation](docs/wolf_editor_real_validation_0.7.6.md)에 있습니다.
