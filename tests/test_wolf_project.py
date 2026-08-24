@@ -265,6 +265,8 @@ class WolfProjectIntegrationTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(0, code)
+        self.assertIn("Engine: WOLF RPG Editor", output.getvalue())
+        self.assertIn("Engine ID: wolf_rpg_editor", output.getvalue())
         self.assertIn("Source mode: auto_txt", output.getvalue())
         self.assertIn("Canonical schema: wolf:v1 provisional", output.getvalue())
         self.assertIn("Native archive apply: unsupported", output.getvalue())

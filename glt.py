@@ -978,7 +978,14 @@ def _handle_project(args: argparse.Namespace, logger: logging.Logger) -> int:
                 engine=EngineId(args.engine) if args.engine else None,
             )
             print(f"Project created: {result.project_directory}")
-            print(f"Engine: {result.config.engine.value}")
+            engine_label = (
+                ENGINE_DISPLAY_NAMES[result.config.engine]
+                if result.config.engine is EngineId.WOLF_RPG_EDITOR
+                else result.config.engine.value
+            )
+            print(f"Engine: {engine_label}")
+            if result.config.engine is EngineId.WOLF_RPG_EDITOR:
+                print(f"Engine ID: {result.config.engine.value}")
             print(
                 "Source mode: "
                 f"{result.config.engine_metadata.get('source_mode', 'game_directory')}"
