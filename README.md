@@ -1,7 +1,7 @@
 # Game Localization Toolkit (GLT)
 
 Windows 11에서 일본 동인게임의 번역 가능한 문자열을 안전하게 다루기 위한
-개인용 Python 도구입니다. 현재 버전은 **GLT 0.7.7**이며 RPG Maker MV/MZ의
+개인용 Python 도구입니다. 현재 버전은 **GLT 0.8.0**이며 RPG Maker MV/MZ의
 엔진 감지, UTF-8 JSONL 추출, 별도 폴더 안전 적용, 독립 QA, dry-run,
 fingerprint와 이식 가능한 번역 Project, 사용자 Glossary 및 JSONL Translation
 Memory, 폰트 진단과 안전한 기본 폰트 패치를 구현합니다. 대용량 번역 JSONL은
@@ -910,3 +910,23 @@ WOLF QA 결과는 Project의 `reports/qa_report.json`, `qa_issues.csv`,
 격리 복사본에서 Text I/O를 검증한 뒤 Auto.txt Project 흐름을 사용하십시오.
 상세 구조와 안전 정책은
 [WOLF Project integration](docs/wolf_project_integration_0.7.7.md)에 있습니다.
+
+## 0.8.0 WOLF native format research
+
+0.8.0은 native writer나 archive 해제를 추가하지 않습니다. unpacked WOLF
+프로젝트의 `.dat`/`.mps`를 읽기 전용으로 인벤토리하고, 선택적으로 기존 공식
+`Data_AutoTXT`와 hash-only known-string correlation을 수행하는 연구 명령을
+제공합니다.
+
+```powershell
+python glt.py wolf-native-probe "D:\WolfProject" `
+  --oracle "D:\Evidence\Data_AutoTXT" `
+  --report ".\reports\wolf_native_research.json"
+```
+
+보고서는 게임 및 oracle 폴더 밖의 새 JSON이어야 합니다. 원문과 절대경로는
+저장하지 않으며 byte offset은 증거일 뿐 canonical ID로 사용하지 않습니다.
+`wolf:v1`은 native parser 교차 검증이 더 필요하므로 `V2_LIKELY`로 평가되었지만,
+0.8.0에서 schema를 변경하지 않습니다. 구현체·라이선스 비교, 실제 WOLF 3.682
+관찰 결과, 레이어 아키텍처와 0.8.1 권장 parser는
+[WOLF native format research](docs/wolf_native_research_0.8.0.md)에 있습니다.

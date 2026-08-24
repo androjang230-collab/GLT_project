@@ -36,6 +36,7 @@ from engines.wolf.editor_integration import (
     WolfEditorIntegrationResult,
     write_wolf_editor_report,
 )
+from engines.wolf.native import WolfNativeProbe, write_native_research_report
 from projects.manager import ProjectManager
 from projects.models import ProjectError, ProjectValidationError
 
@@ -264,6 +265,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("reports/wolf_editor_integration.json"),
         help="portable integration report",
+    )
+
+    native_probe_parser = subparsers.add_parser(
+        "wolf-native-probe",
+        help="inventory unpacked WOLF native files using a bounded read-only probe",
+    )
+    native_probe_parser.add_argument("game_directory", type=Path)
+    native_probe_parser.add_argument(
+        "--oracle",
+        type=Path,
+        help="optional official Data_AutoTXT export for hash-only string correlation",
+    )
+    native_probe_parser.add_argument(
+        "--report",
+        type=Path,
+        required=True,
+        help="new portable JSON research report outside the game and oracle trees",
     )
 
     font_check_parser = subparsers.add_parser(
@@ -1110,6 +1128,49 @@ def _handle_project(args: argparse.Namespace, logger: logging.Logger) -> int:
     return 2
 
 
+def _handle_wolf_native_probe(
+    args: argparse.Namespace, logger: logging.Logger
+) -> int:
+    try:
+        game_directory = resolve_input_directory(args.game_directory)
+        oracle_directory = (
+            resolve_input_directory(args.oracle) if args.oracle is not None else None
+        )
+        report_file = resolve_output_file(args.report)
+        if report_file.suffix.casefold() != ".json":
+            raise ValueError("WOLF native research report must use the .json extension")
+        protected_roots = [game_directory]
+        if oracle_directory is not None:
+            protected_roots.append(oracle_directory)
+        if any(
+            report_file == root or report_file.is_relative_to(root)
+            for root in protected_roots
+        ):
+            raise ValueError(
+                "WOLF native research report cannot be written inside the game or oracle directory"
+            )
+        report = WolfNativeProbe().inspect(
+            game_directory, oracle_directory=oracle_directory
+        )
+        write_native_research_report(report_file, report)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        return 2
+
+    print("WOLF Native Format Read-only Probe")
+    print(f"Files: {len(report.files)}")
+    print(
+        "Signatures matched: "
+        f"{sum(item.signature_status == 'matched' for item in report.files)}"
+    )
+    print(f"Oracle mappings: {len(report.mappings)}")
+    print(f"Known-string correlations: {len(report.correlations)}")
+    print(f"Issues: {len(report.issues)}")
+    print("Writes to game/oracle: none")
+    print(f"Report: {report_file}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1139,6 +1200,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "wolf-editor-validate":
         return _handle_wolf_editor_validate(args, logger)
+
+    if args.command == "wolf-native-probe":
+        return _handle_wolf_native_probe(args, logger)
 
     if args.command in {"font-check", "font-patch"}:
         return _handle_font(args, logger)
