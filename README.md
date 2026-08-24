@@ -1,7 +1,7 @@
 # Game Localization Toolkit (GLT)
 
 Windows 11에서 일본 동인게임의 번역 가능한 문자열을 안전하게 다루기 위한
-개인용 Python 도구입니다. 현재 버전은 **GLT 0.7.6**이며 RPG Maker MV/MZ의
+개인용 Python 도구입니다. 현재 버전은 **GLT 0.7.7**이며 RPG Maker MV/MZ의
 엔진 감지, UTF-8 JSONL 추출, 별도 폴더 안전 적용, 독립 QA, dry-run,
 fingerprint와 이식 가능한 번역 Project, 사용자 Glossary 및 JSONL Translation
 Memory, 폰트 진단과 안전한 기본 폰트 패치를 구현합니다. 대용량 번역 JSONL은
@@ -869,3 +869,44 @@ trial에서 최대 3개만 변경해 exact semantic preservation, control token 
 추출/writer 대상으로 승격했지만 cancel/default 의미와 native `.dat`/`.mps` cross-route
 ID는 미검증이므로 `wolf:v1`은 계속 `provisional`입니다. Portable evidence는
 [0.7.6 real Editor validation](docs/wolf_editor_real_validation_0.7.6.md)에 있습니다.
+
+## 0.7.7 WOLF Project integration
+
+공식 WOLF Editor Text I/O가 만든 `Data_AutoTXT`를 기존 GLT ProjectManager에
+직접 연결합니다. RPG Maker와 같은 `project.json`, `source.jsonl`,
+`translated.jsonl`, Glossary, Translation Memory, QA, dry-run, apply 흐름을
+사용하며 WOLF 전용 프로젝트 포맷은 만들지 않습니다.
+
+```powershell
+python glt.py project create "D:\Data_AutoTXT" `
+  --engine wolf_rpg_editor `
+  --output "D:\Localization\WolfGame_KR"
+
+python glt.py project qa `
+  "D:\Localization\WolfGame_KR" `
+  "D:\Data_AutoTXT"
+
+python glt.py project apply `
+  "D:\Localization\WolfGame_KR" `
+  "D:\Data_AutoTXT" `
+  --output "D:\Data_AutoTXT_KR" `
+  --dry-run
+
+python glt.py project apply `
+  "D:\Localization\WolfGame_KR" `
+  "D:\Data_AutoTXT" `
+  --output "D:\Data_AutoTXT_KR"
+```
+
+`--engine`을 생략해도 유효한 `.Auto.txt` export는 자동 감지합니다. Project의
+fingerprint와 `source_mode=auto_txt`가 현재 source와 다르면 apply를 차단합니다.
+WOLF QA 결과는 Project의 `reports/qa_report.json`, `qa_issues.csv`,
+`untranslated.csv`, `project_manifest.json`에 저장됩니다. dry-run은 output을 만들지
+않고 같은 WOLF preflight와 round-trip 검증을 수행합니다.
+
+현재 Project apply의 output은 번역된 `Data_AutoTXT` 복사본입니다. 네이티브
+`.dat`/`.mps` 프로젝트에 대한 `Editor.exe -txtinput` 자동 적용은 0.7.7 Project
+명령에 연결하지 않았습니다. 필요한 경우 기존 `wolf-editor-validate`로 원본 밖의
+격리 복사본에서 Text I/O를 검증한 뒤 Auto.txt Project 흐름을 사용하십시오.
+상세 구조와 안전 정책은
+[WOLF Project integration](docs/wolf_project_integration_0.7.7.md)에 있습니다.

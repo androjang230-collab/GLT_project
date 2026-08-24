@@ -14,7 +14,7 @@ from core.fingerprint import GameFingerprint
 from core.models import ApplyIssue, ApplyReport, EngineId
 from core.qa import QaResult
 from core.registry import EngineRegistry
-from core.reports import write_dry_run_report
+from core.reports import write_apply_report, write_dry_run_report
 from core.version import PROJECT_VERSION, SCHEMA_VERSION, TOOL_VERSION
 from engines.registry import create_engine_registry
 from projects.glossary import (
@@ -52,23 +52,41 @@ class ProjectManager:
         self,
         game_directory: Path,
         project_directory: Path,
+        *,
+        engine: EngineId | None = None,
     ) -> ProjectCreateResult:
         game_directory = game_directory.resolve()
         project_directory = project_directory.resolve()
         self._validate_new_project_path(game_directory, project_directory)
-        selection = self._registry.identify(game_directory)
-        detection = selection.detection
-        if not selection.detected or selection.adapter is None or detection.engine is None:
-            raise ProjectError("RPG Maker MV/MZ could not be detected")
-        adapter = selection.adapter
+        if engine is not None:
+            adapter = self._registry.adapter_for(engine)
+            if adapter is None:
+                raise ProjectError(f"unsupported project engine: {engine.value}")
+            detection = adapter.detect_project_source(game_directory)
+            if not detection.detected or detection.engine != engine:
+                raise ProjectError(
+                    f"source is not a supported {engine.value} project source"
+                )
+        else:
+            selection = self._registry.identify_project_source(game_directory)
+            adapter = selection.adapter
+            detection = selection.detection
+        if adapter is None or not detection.detected or detection.engine is None:
+            raise ProjectError("a supported game or translation source could not be detected")
 
         extraction = adapter.extract_entries(game_directory)
-        if extraction.issues:
+        extraction_errors = adapter.project_extraction_errors(extraction)
+        if extraction_errors:
             details = "; ".join(
-                f"{issue.file}: {issue.message}" for issue in extraction.issues
+                _extraction_issue_text(issue) for issue in extraction_errors
             )
             raise ProjectError(f"project extraction failed: {details}")
         fingerprint = adapter.fingerprint(game_directory, detection.engine)
+        engine_metadata = {
+            "engine_id": detection.engine.value,
+            "source_mode": adapter.project_source_mode(game_directory),
+            **dict(adapter.project_metadata(game_directory, extraction)),
+        }
         config = ProjectConfig(
             project_version=PROJECT_VERSION,
             schema_version=SCHEMA_VERSION,
@@ -80,6 +98,7 @@ class ProjectManager:
             glossary_file="glossary.csv",
             translation_memory_file="translation_memory.jsonl",
             allowlist_file="config/japanese_allowlist.txt",
+            engine_metadata=engine_metadata,
         )
 
         project_directory.parent.mkdir(parents=True, exist_ok=True)
@@ -190,6 +209,8 @@ class ProjectManager:
         )
         if dry_run:
             write_dry_run_report(context.reports_directory, report)
+        else:
+            write_apply_report(context.reports_directory, report)
         return report
 
     def tm_fill(self, project_directory: Path) -> TmOperationResult:
@@ -277,11 +298,16 @@ class ProjectManager:
         context: ProjectContext,
         game_directory: Path,
     ) -> tuple[EnginePlugin, EngineId, list[ApplyIssue]]:
-        selection = self._registry.identify(game_directory)
-        detection = selection.detection
-        if not selection.detected or selection.adapter is None or detection.engine is None:
-            raise ProjectError("RPG Maker MV/MZ could not be detected")
-        adapter = selection.adapter
+        adapter = self._registry.adapter_for(context.config.engine)
+        if adapter is None:
+            raise ProjectError(
+                f"no adapter is registered for {context.config.engine.value}"
+            )
+        detection = adapter.detect_project_source(game_directory)
+        if not detection.detected or detection.engine is None:
+            raise ProjectError(
+                f"source is not valid for project engine {context.config.engine.value}"
+            )
         engine = detection.engine
         issues: list[ApplyIssue] = []
         if context.config.project_version != PROJECT_VERSION:
@@ -315,6 +341,21 @@ class ProjectManager:
                     ),
                 )
             )
+        expected_source_mode = context.config.engine_metadata.get(
+            "source_mode", "game_directory"
+        )
+        current_source_mode = adapter.project_source_mode(game_directory)
+        if expected_source_mode != current_source_mode:
+            issues.append(
+                ApplyIssue(
+                    severity="conflict",
+                    code="PROJECT_SOURCE_MODE_MISMATCH",
+                    reason=(
+                        f"project source mode {expected_source_mode!r} differs from "
+                        f"current source mode {current_source_mode!r}"
+                    ),
+                )
+            )
         current = adapter.fingerprint(game_directory, engine)
         if context.config.game_fingerprint != current.value:
             issues.append(
@@ -344,3 +385,9 @@ class ProjectManager:
         ]
         if blockers:
             raise ProjectValidationError(blockers)
+
+
+def _extraction_issue_text(issue: object) -> str:
+    file_name = getattr(issue, "file", None) or getattr(issue, "source_file", None) or "."
+    message = getattr(issue, "message", None) or getattr(issue, "reason", None) or str(issue)
+    return f"{file_name}: {message}"

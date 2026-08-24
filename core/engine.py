@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -51,6 +51,38 @@ class EnginePlugin(ABC):
     @abstractmethod
     def detect(self, game_directory: Path) -> DetectionResult:
         """Inspect a game directory without modifying it."""
+
+    def detect_project_source(self, source_directory: Path) -> DetectionResult:
+        """Identify a source accepted by the portable Project workflow.
+
+        Most engines use the ordinary game directory.  An adapter may also
+        accept an official, portable interchange directory such as WOLF
+        ``Data_AutoTXT`` without changing the common Project format.
+        """
+
+        return self.detect(source_directory)
+
+    def project_source_mode(self, source_directory: Path) -> str:
+        """Return a portable adapter-defined source-mode identifier."""
+
+        return "game_directory"
+
+    def project_metadata(
+        self,
+        source_directory: Path,
+        extraction: ExtractionResult,
+    ) -> Mapping[str, object]:
+        """Return optional engine metadata stored in ``project.json``."""
+
+        return {}
+
+    def project_extraction_errors(
+        self,
+        extraction: ExtractionResult,
+    ) -> Sequence[object]:
+        """Return extraction issues that must block Project creation."""
+
+        return extraction.issues
 
     def extract_entries(self, game_directory: Path) -> ExtractionResult:
         """Extract entries in memory without assuming a storage format in core."""

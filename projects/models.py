@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -33,9 +33,10 @@ class ProjectConfig:
     glossary_file: str
     translation_memory_file: str
     allowlist_file: str
+    engine_metadata: dict[str, object] = field(default_factory=dict)
 
     def to_json_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "project_version": self.project_version,
             "schema_version": self.schema_version,
             "tool_version": self.tool_version,
@@ -47,6 +48,9 @@ class ProjectConfig:
             "translation_memory_file": self.translation_memory_file,
             "allowlist_file": self.allowlist_file,
         }
+        if self.engine_metadata:
+            payload["engine_metadata"] = self.engine_metadata
+        return payload
 
     @classmethod
     def from_json_dict(cls, payload: Any) -> "ProjectConfig":
@@ -81,6 +85,10 @@ class ProjectConfig:
             "allowlist_file",
         ):
             _validate_relative_member(payload[name], name)
+        engine_metadata = payload.get("engine_metadata", {})
+        if not isinstance(engine_metadata, dict):
+            raise ProjectError("project.json field 'engine_metadata' must be an object")
+        _validate_portable_metadata(engine_metadata)
         return cls(
             project_version=payload["project_version"],
             schema_version=payload["schema_version"],
@@ -92,6 +100,7 @@ class ProjectConfig:
             glossary_file=payload["glossary_file"],
             translation_memory_file=payload["translation_memory_file"],
             allowlist_file=payload["allowlist_file"],
+            engine_metadata=engine_metadata,
         )
 
 
@@ -153,3 +162,25 @@ def _validate_relative_member(value: str, field_name: str) -> None:
         or not path.parts
     ):
         raise ProjectError(f"{field_name} must be a project-relative path")
+
+
+def _validate_portable_metadata(value: object, *, key: str = "engine_metadata") -> None:
+    """Reject obvious machine-specific absolute paths in extension metadata."""
+
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            if not isinstance(child_key, str):
+                raise ProjectError(f"{key} keys must be strings")
+            _validate_portable_metadata(child, key=f"{key}.{child_key}")
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_portable_metadata(child, key=f"{key}[{index}]")
+        return
+    if value is None or isinstance(value, (bool, int, float)):
+        return
+    if not isinstance(value, str):
+        raise ProjectError(f"{key} contains an unsupported value")
+    windows_path = PureWindowsPath(value)
+    if Path(value).is_absolute() or windows_path.is_absolute() or windows_path.drive:
+        raise ProjectError(f"{key} must not contain an absolute path")

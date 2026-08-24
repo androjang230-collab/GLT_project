@@ -88,5 +88,27 @@ class EngineRegistry:
             ),
         )
 
+    def identify_project_source(self, source_directory: Path) -> EngineSelection:
+        """Select an adapter for a common Project source directory."""
+
+        results = [
+            (adapter, adapter.detect_project_source(source_directory))
+            for adapter in self._engines
+        ]
+        if not results:
+            return EngineSelection(None, DetectionResult.unknown())
+        detected = [item for item in results if item[1].detected]
+        if detected:
+            adapter, result = max(detected, key=lambda item: item[1].confidence)
+            return EngineSelection(adapter, result)
+        _, strongest = max(results, key=lambda item: item[1].confidence)
+        return EngineSelection(
+            None,
+            DetectionResult.unknown(
+                confidence=strongest.confidence,
+                evidence=strongest.evidence,
+            ),
+        )
+
     def detect(self, game_directory: Path) -> DetectionResult:
         return self.identify(game_directory).detection

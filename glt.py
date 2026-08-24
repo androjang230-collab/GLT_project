@@ -305,6 +305,14 @@ def build_parser() -> argparse.ArgumentParser:
     project_create = project_commands.add_parser("create")
     project_create.add_argument("game_directory", type=Path)
     project_create.add_argument("--output", type=Path, required=True)
+    project_create.add_argument(
+        "--engine",
+        choices=tuple(engine.value for engine in EngineId),
+        help=(
+            "explicit source engine; use wolf_rpg_editor for an official "
+            "Data_AutoTXT export"
+        ),
+    )
 
     project_qa = project_commands.add_parser("qa")
     project_qa.add_argument("project_directory", type=Path)
@@ -964,11 +972,39 @@ def _handle_project(args: argparse.Namespace, logger: logging.Logger) -> int:
         if args.project_command == "create":
             game_directory = resolve_input_directory(args.game_directory)
             project_directory = resolve_new_directory(args.output)
-            result = manager.create(game_directory, project_directory)
+            result = manager.create(
+                game_directory,
+                project_directory,
+                engine=EngineId(args.engine) if args.engine else None,
+            )
             print(f"Project created: {result.project_directory}")
             print(f"Engine: {result.config.engine.value}")
+            print(
+                "Source mode: "
+                f"{result.config.engine_metadata.get('source_mode', 'game_directory')}"
+            )
             print(f"Game fingerprint: {result.fingerprint.value}")
             print(f"Translation entries: {result.translation_entries}")
+            if result.config.engine is EngineId.WOLF_RPG_EDITOR:
+                metadata = result.config.engine_metadata
+                summary = metadata.get("extraction_summary", {})
+                schema = metadata.get("wolf_location_schema", {})
+                if isinstance(summary, dict):
+                    print(
+                        "Experimental excluded: "
+                        f"{summary.get('experimental_excluded', 0)}"
+                    )
+                    print(f"Unknown records: {summary.get('unknown_records', 0)}")
+                if isinstance(schema, dict):
+                    print(
+                        "Canonical schema: "
+                        f"wolf:v{schema.get('version', 1)} "
+                        f"{schema.get('status', 'provisional')}"
+                    )
+                print("Choice: option text verified; cancel/default not verified")
+                print("DB description/help: unsupported")
+                print("CP932 to Korean: not verified")
+                print("Native archive apply: unsupported")
             return 0
 
         project_directory = resolve_input_directory(args.project_directory)
