@@ -40,6 +40,17 @@ def _document(game: Path) -> dict[str, object]:
     return json.loads((game / "data/Map001.json").read_text(encoding="utf-8"))
 
 
+def _write_mv_plugin(game: Path, name: str, source: str, *, enabled: bool = True) -> None:
+    plugin_directory = game / "js/plugins"
+    plugin_directory.mkdir(parents=True, exist_ok=True)
+    (plugin_directory / f"{name}.js").write_text(source, encoding="utf-8")
+    records = [{"name": name, "status": enabled, "description": "", "parameters": {}}]
+    (game / "js/plugins.js").write_text(
+        "var $plugins = " + json.dumps(records) + ";",
+        encoding="utf-8",
+    )
+
+
 class RpgMakerPluginTextTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -67,10 +78,22 @@ class RpgMakerPluginTextTests(unittest.TestCase):
         entry = RpgMakerExtractor(EngineId.RPGMAKER_MV).extract(game).entries[0]
         self.assertEqual(r"\C[2]お知らせ", entry.original)
         self.assertEqual("verified", entry.extra_metadata["classification"])
+        self.assertEqual("mv_info_display", entry.extra_metadata["plugin_rule"])
         report, output, _ = self._apply(game, EngineId.RPGMAKER_MV, r"\C[2]알림")
         raw = _document(output)["events"][1]["pages"][0]["list"][0]["parameters"][0]
         self.assertEqual(r"インフォ表示   \C[2]알림", raw)
         self.assertEqual(1, report.applied)
+
+    def test_existing_showinfo_english_rule_keeps_id_shape_and_space_policy(self) -> None:
+        game = _write_game(
+            self.root,
+            EngineId.RPGMAKER_MV,
+            [_command(356, ["ShowInfo synthetic"])],
+        )
+        entry = RpgMakerExtractor(EngineId.RPGMAKER_MV).extract(game).entries[0]
+        self.assertTrue(entry.id.endswith("cmd356:index0:param0"))
+        self.assertEqual("synthetic", entry.original)
+        self.assertEqual("requires_protection", entry.extra_metadata["space_policy"])
 
     def test_mv_internal_commands_are_excluded_and_unknown_text_is_conditional(self) -> None:
         commands = [
@@ -186,6 +209,74 @@ class RpgMakerPluginTextTests(unittest.TestCase):
         output = self.root / "project-output"
         applied = manager.apply(project, game, output)
         self.assertEqual(1, applied.applied)
+
+    def test_discovered_joined_slice_rule_extracts_and_applies_only_payload(self) -> None:
+        game = _write_game(
+            self.root,
+            EngineId.RPGMAKER_MV,
+            [_command(356, ["Tail stable old words"])],
+        )
+        _write_mv_plugin(game, "TailPlugin", """
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ if (command === 'Tail') { $gameMessage.add(args.slice(1).join(' ')); }
+};
+""")
+        entries = RpgMakerExtractor(EngineId.RPGMAKER_MV).extract(game).entries
+        self.assertEqual(1, len(entries))
+        self.assertEqual("old words", entries[0].original)
+        self.assertEqual("joined_slice", entries[0].extra_metadata["argument_mode"])
+        report, output, _ = self._apply(game, EngineId.RPGMAKER_MV, "new translated words")
+        raw = _document(output)["events"][1]["pages"][0]["list"][0]["parameters"][0]
+        self.assertEqual("Tail stable new translated words", raw)
+        self.assertEqual(1, report.applied)
+
+    def test_discovered_single_token_translation_with_space_is_blocked(self) -> None:
+        game = _write_game(
+            self.root,
+            EngineId.RPGMAKER_MV,
+            [_command(356, ["Notice old"])],
+        )
+        _write_mv_plugin(game, "NoticePlugin", """
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ if (command === 'Notice') { $gameMessage.add(args[0]); }
+};
+""")
+        report, _, _ = self._apply(game, EngineId.RPGMAKER_MV, "two words")
+        self.assertEqual(0, report.applied)
+        self.assertTrue(any(issue.code == "PLUGIN_ARGUMENT_SPACE_UNSAFE" for issue in report.issues))
+
+    def test_discovered_normalized_command_applies_with_original_prefix_case(self) -> None:
+        game = _write_game(
+            self.root,
+            EngineId.RPGMAKER_MV,
+            [_command(356, ["popup old words"])],
+        )
+        _write_mv_plugin(game, "PopupPlugin", """
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ switch (command.toUpperCase()) {
+ case 'POPUP': $gameMessage.add(args.join(' ')); break;
+ }
+};
+""")
+        entry = RpgMakerExtractor(EngineId.RPGMAKER_MV).extract(game).entries[0]
+        self.assertEqual("upper", entry.extra_metadata["command_normalization"])
+        report, output, _ = self._apply(game, EngineId.RPGMAKER_MV, "new translated words")
+        raw = _document(output)["events"][1]["pages"][0]["list"][0]["parameters"][0]
+        self.assertEqual("popup new translated words", raw)
+        self.assertEqual(1, report.applied)
+
+    def test_disabled_discovered_plugin_does_not_expand_extraction(self) -> None:
+        game = _write_game(
+            self.root,
+            EngineId.RPGMAKER_MV,
+            [_command(356, ["Notice old"])],
+        )
+        _write_mv_plugin(game, "NoticePlugin", """
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ if (command === 'Notice') { $gameMessage.add(args[0]); }
+};
+""", enabled=False)
+        self.assertEqual([], RpgMakerExtractor(EngineId.RPGMAKER_MV).extract(game).entries)
 
 
 if __name__ == "__main__":

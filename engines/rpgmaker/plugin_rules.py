@@ -17,6 +17,7 @@ CONDITIONAL = "CONDITIONAL_TRANSLATABLE"
 INTERNAL = "INTERNAL"
 
 MV_INFO_PREFIX = "インフォ表示"
+MV_INFO_PREFIXES = frozenset({"ShowInfo", MV_INFO_PREFIX})
 MZ_LOG_PLUGIN = "MNKR_TMLogWindowMZ"
 MZ_LOG_COMMAND = "addLog"
 MZ_LOG_ARGUMENT_PATH = "text"
@@ -69,6 +70,17 @@ class MzArgumentText:
     rule_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class MvRuntimePayload:
+    command: str
+    payload: str
+    start: int
+    end: int
+
+    def rebuild(self, raw: str, translation: str) -> str:
+        return raw[:self.start] + translation + raw[self.end:]
+
+
 def classify_mv_command(raw: str) -> MvPluginText:
     """Split one MV command without losing its exact prefix separator."""
 
@@ -80,7 +92,7 @@ def classify_mv_command(raw: str) -> MvPluginText:
     separator = match.group("separator")
     payload = match.group("payload")
     upper = prefix.upper()
-    if prefix == MV_INFO_PREFIX and payload.strip():
+    if prefix in MV_INFO_PREFIXES and payload.strip():
         return MvPluginText(leading, prefix, separator, payload, VERIFIED, "mv_info_display")
     if upper in {"P_SHAKE", "P_SPIN_RELATIVE"}:
         return MvPluginText(leading, prefix, separator, payload, INTERNAL)
@@ -94,6 +106,35 @@ def classify_mv_command(raw: str) -> MvPluginText:
     )
     classification = CONDITIONAL if looks_textual else INTERNAL
     return MvPluginText(leading, prefix, separator, payload, classification)
+
+
+def extract_runtime_payload(
+    raw: str,
+    argument_mode: str,
+    payload_start: int | None,
+) -> MvRuntimePayload | None:
+    """Resolve a discovery rule to one exact replaceable span in raw code 356."""
+
+    tokens = list(re.finditer(r"\S+", raw))
+    if len(tokens) < 2:
+        return None
+    command = tokens[0].group(0)
+    args = tokens[1:]
+    start_index = payload_start if payload_start is not None else 0
+    if start_index < 0 or start_index >= len(args):
+        return None
+    if argument_mode in {"single_token", "fixed_index"}:
+        token = args[start_index]
+        return MvRuntimePayload(command, token.group(0), token.start(), token.end())
+    if argument_mode in {"joined_remainder", "joined_slice"}:
+        selected = args[start_index:]
+        return MvRuntimePayload(
+            command,
+            " ".join(item.group(0) for item in selected),
+            selected[0].start(),
+            selected[-1].end(),
+        )
+    return None
 
 
 def iter_mz_argument_texts(
@@ -154,9 +195,9 @@ def rebuild_editor_annotation(value: str, translation: str) -> str:
 
 
 __all__ = [
-    "CONDITIONAL", "INTERNAL", "MV_INFO_PREFIX", "MZ_LOG_ARGUMENT_PATH",
-    "MZ_LOG_COMMAND", "MZ_LOG_PLUGIN", "MzArgumentText", "MvPluginText",
-    "TEXT_LIKE_KEYS", "VERIFIED", "classify_mv_command",
+    "CONDITIONAL", "INTERNAL", "MV_INFO_PREFIX", "MV_INFO_PREFIXES", "MZ_LOG_ARGUMENT_PATH",
+    "MZ_LOG_COMMAND", "MZ_LOG_PLUGIN", "MvRuntimePayload", "MzArgumentText", "MvPluginText",
+    "TEXT_LIKE_KEYS", "VERIFIED", "classify_mv_command", "extract_runtime_payload",
     "iter_mz_argument_texts", "parse_editor_annotation",
     "rebuild_editor_annotation",
 ]

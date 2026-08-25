@@ -1,7 +1,7 @@
 # Game Localization Toolkit (GLT)
 
 Windows 11에서 일본 동인게임의 번역 가능한 문자열을 안전하게 다루기 위한
-개인용 Python 도구입니다. 현재 버전은 **GLT 0.8.3**이며 RPG Maker MV/MZ의
+개인용 Python 도구입니다. 현재 버전은 **GLT 0.8.4**이며 RPG Maker MV/MZ의
 엔진 감지, UTF-8 JSONL 추출, 별도 폴더 안전 적용, 독립 QA, dry-run,
 fingerprint와 이식 가능한 번역 Project, 사용자 Glossary 및 JSONL Translation
 Memory, 폰트 진단과 안전한 기본 폰트 패치를 구현합니다. 대용량 번역 JSONL은
@@ -982,3 +982,29 @@ argument는 bounded audit candidate이며 plugin name, command와 argument path�
 standalone `657`은 번역 단위가 아닙니다. 자세한 규칙과 검증 결과는
 [RPG Maker plugin text coverage](docs/rpgmaker_plugin_text_coverage_0.8.3.md)에
 정리되어 있습니다.
+
+## 0.8.4 RPG Maker MV plugin command discovery
+
+MV `plugins.js`의 enabled/load order와 정확히 같은 이름의 plugin source를
+read-only로 연결해 `pluginCommand`의 literal branch, argument flow, 최대 1단계
+helper, display/internal sink를 bounded lexical analysis로 추적합니다. JavaScript를
+실행하거나 전체 literal을 추출하지 않으며 dynamic/minified/ambiguous handler는
+UNKNOWN 또는 CONDITIONAL로 남깁니다.
+
+```powershell
+python glt.py rpgmaker-audit "D:\Games\Example" `
+  --report ".\reports\rpgmaker_coverage.json"
+
+# 분리 보관된 read-only evidence를 사용할 때만 지정
+python glt.py rpgmaker-audit "D:\Games\Example" `
+  --plugins-config "D:\Evidence\plugins.js" `
+  --plugin-source "D:\Evidence\plugins" `
+  --report ".\reports\rpgmaker_coverage.json"
+```
+
+지원 argument mode는 `single_token`, `fixed_index`, `joined_remainder`,
+`joined_slice`, `multiple_fixed`, `numeric`, `identifier`, `unknown`입니다.
+reconstruction까지 확정된 `APPLY_VERIFIED`만 기존 JSONL extraction/apply에
+연결합니다. single-token 번역에 일반 공백이 생기면
+`PLUGIN_ARGUMENT_SPACE_UNSAFE`로 차단하며 NBSP 자동 변환은 하지 않습니다.
+기존 `ShowInfo`/`インフォ表示` 위치 ID와 schema version 1은 유지됩니다.

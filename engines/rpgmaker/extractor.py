@@ -18,7 +18,12 @@ from core.translation_io import write_jsonl
 from engines.rpgmaker.plugin_rules import (
     VERIFIED,
     classify_mv_command,
+    extract_runtime_payload,
     iter_mz_argument_texts,
+)
+from engines.rpgmaker.mv_plugin_discovery import (
+    MvPluginDiscovery,
+    discover_mv_plugin_commands,
 )
 
 
@@ -107,6 +112,7 @@ class RpgMakerExtractor:
         if engine not in (EngineId.RPGMAKER_MV, EngineId.RPGMAKER_MZ):
             raise ValueError(f"unsupported engine: {engine}")
         self.engine = engine
+        self._mv_runtime_rules: dict[str, MvPluginDiscovery] = {}
 
     def extract(self, game_directory: Path) -> ExtractionResult:
         data_directory = game_directory / "data"
@@ -116,6 +122,21 @@ class RpgMakerExtractor:
                 ExtractionIssue("data", "data directory does not exist")
             )
             return result
+
+        self._mv_runtime_rules = {}
+        if self.engine == EngineId.RPGMAKER_MV:
+            config = game_directory / "js/plugins.js"
+            sources = game_directory / "js/plugins"
+            if config.is_file() and sources.is_dir():
+                try:
+                    discovery = discover_mv_plugin_commands(config, sources)
+                    self._mv_runtime_rules = {
+                        item.command: item
+                        for item in discovery.observations
+                        if item.classification == "APPLY_VERIFIED"
+                    }
+                except (OSError, UnicodeError, ValueError):
+                    self._mv_runtime_rules = {}
 
         map_names = self._load_map_names(data_directory, result)
 
@@ -526,9 +547,59 @@ class RpgMakerExtractor:
                                 "plugin_command": match.prefix,
                                 "argument_path": "payload",
                                 "plugin_rule": match.rule_id,
+                                "argument_mode": "single_token",
+                                "payload_start": 0,
+                                "space_policy": "requires_protection",
                             },
                         )
                     )
+                else:
+                    discovery = next(
+                        (
+                            item for item in self._mv_runtime_rules.values()
+                            if item.matches(match.prefix)
+                        ),
+                        None,
+                    )
+                    payload = (
+                        extract_runtime_payload(
+                            parameters[0],
+                            discovery.argument_mode,
+                            discovery.payload_start,
+                        )
+                        if discovery is not None else None
+                    )
+                    if discovery is not None and payload is not None:
+                        entries.append(
+                            self._command_entry(
+                                file_name=file_name,
+                                context_id=context_id,
+                                code=356,
+                                command_index=command_index,
+                                parameter_index=0,
+                                text=payload.payload,
+                                text_type="plugin_text",
+                                json_path=f"{json_prefix}[{command_index}].parameters[0]",
+                                event_id=event_id,
+                                page_id=page_id,
+                                extra_metadata={
+                                    "source_kind": "plugin_command",
+                                    "classification": "apply_verified",
+                                    "plugin_name": discovery.plugin_name,
+                                    "plugin_command": discovery.command,
+                                    "argument_path": "payload",
+                                    "plugin_rule": "mv_source_discovery_v1",
+                                    "plugin_file": discovery.plugin_file,
+                                    "command_normalization": discovery.command_normalization,
+                                    "argument_mode": discovery.argument_mode,
+                                    "consumed_arguments": list(discovery.consumed_arguments),
+                                    "payload_start": discovery.payload_start,
+                                    "sink": discovery.sink,
+                                    "helper_chain": list(discovery.helper_chain),
+                                    "space_policy": discovery.space_policy,
+                                },
+                            )
+                        )
             elif code == 357 and len(parameters) > 3:
                 plugin_name = parameters[0] if isinstance(parameters[0], str) else ""
                 plugin_command = parameters[1] if isinstance(parameters[1], str) else ""

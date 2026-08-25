@@ -45,6 +45,15 @@ class StringCandidate:
     command_name: str | None = None
     argument_path: str | None = None
     rule_id: str | None = None
+    plugin_file: str | None = None
+    handler_evidence: str | None = None
+    consumed_arguments: tuple[int, ...] = ()
+    argument_mode: str | None = None
+    helper_chain: tuple[str, ...] = ()
+    sink: str | None = None
+    confidence: str | None = None
+    space_policy: str | None = None
+    unresolved_reason: str | None = None
     display_api: str | None = None
 
 
@@ -107,6 +116,7 @@ class RpgMakerCoverageReport:
     database_fields: list[DatabaseFieldObservation] = field(default_factory=list)
     issues: list[AuditIssue] = field(default_factory=list)
     statistics: dict[str, Any] = field(default_factory=dict)
+    plugin_discovery: dict[str, Any] = field(default_factory=dict)
     actual_files_scanned: tuple[str, ...] = ()
 
     @property

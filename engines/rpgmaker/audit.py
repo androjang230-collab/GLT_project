@@ -35,8 +35,18 @@ from engines.rpgmaker.plugin_rules import (
     INTERNAL as PLUGIN_INTERNAL,
     VERIFIED as PLUGIN_VERIFIED,
     classify_mv_command,
+    extract_runtime_payload,
     iter_mz_argument_texts,
     parse_editor_annotation,
+)
+from engines.rpgmaker.mv_plugin_discovery import (
+    APPLY_VERIFIED,
+    DISCOVERED_VERIFIED,
+    INTERNAL as DISCOVERY_INTERNAL,
+    UNKNOWN as DISCOVERY_UNKNOWN,
+    UNSAFE as DISCOVERY_UNSAFE,
+    MvPluginDiscovery,
+    discover_mv_plugin_commands,
 )
 from engines.rpgmaker.validator import detect_japanese_scripts
 
@@ -233,31 +243,78 @@ def _candidate(
 class RpgMakerCoverageAuditor:
     """Inventory standard and extension text surfaces without changing source."""
 
-    def __init__(self, engine: EngineId) -> None:
+    def __init__(
+        self,
+        engine: EngineId,
+        *,
+        plugin_config_file: Path | None = None,
+        plugin_source_directory: Path | None = None,
+        data_directory: Path | None = None,
+        sample_name: str | None = None,
+    ) -> None:
         if engine not in {EngineId.RPGMAKER_MV, EngineId.RPGMAKER_MZ}:
             raise ValueError(f"unsupported engine: {engine}")
         self.engine = engine
         self._mv_plugin_prefix_counts: Counter[tuple[str, str, str]] = Counter()
+        self._plugin_config_file = plugin_config_file
+        self._plugin_source_directory = plugin_source_directory
+        self._data_directory = data_directory
+        self._sample_name = sample_name
+        self._discovery_by_command: dict[str, MvPluginDiscovery] = {}
 
     def audit(self, game_directory: Path) -> RpgMakerCoverageReport:
         game_directory = game_directory.resolve()
         self._mv_plugin_prefix_counts.clear()
-        before = _snapshot(game_directory)
+        before = _snapshot(game_directory, self._data_directory)
         report = RpgMakerCoverageReport(
             tool_version=TOOL_VERSION,
             report_schema_version=REPORT_SCHEMA_VERSION,
             engine=self.engine.value,
             data_path="data",
-            plugin_metadata_available=(game_directory / "js/plugins.js").is_file(),
+            plugin_metadata_available=(
+                self._plugin_config_file is not None
+                and self._plugin_config_file.is_file()
+            ) or (game_directory / "js/plugins.js").is_file(),
             source_before=before,
         )
+        if self.engine == EngineId.RPGMAKER_MV:
+            config = self._plugin_config_file
+            sources = self._plugin_source_directory
+            if config is None:
+                default = game_directory / "js/plugins.js"
+                config = default if default.is_file() else None
+            if sources is None:
+                sources = game_directory / "js/plugins"
+            if sources.is_dir():
+                discovery = discover_mv_plugin_commands(config, sources)
+                report.plugin_discovery = discovery.to_json_dict()
+                report.issues.extend(
+                    AuditIssue(
+                        item.severity,
+                        item.code,
+                        item.plugin_file or "",
+                        item.reason,
+                    )
+                    for item in discovery.issues
+                )
+                if self._sample_name is not None:
+                    report.plugin_discovery["sample"] = self._sample_name
+                unique: dict[str, list[MvPluginDiscovery]] = defaultdict(list)
+                for item in discovery.observations:
+                    unique[item.command].append(item)
+                self._discovery_by_command = {
+                    command: items[0] for command, items in unique.items()
+                    if len(items) == 1
+                }
+            else:
+                self._discovery_by_command = {}
         counters: dict[int, Counter[str]] = defaultdict(Counter)
         move_counters: dict[int, Counter[str]] = defaultdict(Counter)
         file_code_counts: dict[str, Counter[int]] = defaultdict(Counter)
         scanned: list[str] = []
         command_total = 0
 
-        for path in _data_files(game_directory):
+        for path in _data_files(game_directory, self._data_directory):
             relative = path.relative_to(game_directory).as_posix()
             scanned.append(relative)
             try:
@@ -282,11 +339,11 @@ class RpgMakerCoverageAuditor:
                     )
 
         report.plugins = _plugin_inventory(game_directory, report.issues)
-        report.database_fields = _database_inventory(game_directory, report.issues)
+        report.database_fields = _database_inventory(game_directory, report.issues, self._data_directory)
         report.event_commands = _event_inventory(counters)
         report.move_route_commands = _move_inventory(move_counters)
         report.actual_files_scanned = tuple(scanned)
-        report.source_after = _snapshot(game_directory)
+        report.source_after = _snapshot(game_directory, self._data_directory)
         if not report.source_unchanged:
             report.issues.append(
                 AuditIssue("error", "SOURCE_CHANGED_DURING_AUDIT", "", "source snapshot differs after audit")
@@ -360,25 +417,38 @@ class RpgMakerCoverageAuditor:
                 self._add(report, counters, code, _candidate(params[0], location, code, "[0]", classification, "script", evidence, display_api=display.group(0) if display else None))
             elif code == 356 and params and _text(params[0]):
                 match = classify_mv_command(params[0])
+                discovery = next(
+                    (
+                        item for item in self._discovery_by_command.values()
+                        if item.matches(match.prefix)
+                    ),
+                    None,
+                )
+                effective = _effective_mv_classification(match.classification, discovery)
                 safe_prefix = _safe_identifier(match.prefix) or "<unknown>"
                 self._mv_plugin_prefix_counts[
-                    (safe_prefix, match.rule_id or "<none>", match.classification)
+                    (safe_prefix, match.rule_id or (discovery.classification if discovery else "<none>"), effective)
                 ] += 1
-                if match.classification == PLUGIN_INTERNAL:
+                if effective == Class.INTERNAL.value:
                     counters[code][Class.INTERNAL.value] += 1
                 else:
-                    classification = Class(match.classification)
+                    classification = Class(effective)
                     evidence = (
                         f"verified rule {match.rule_id}; payload only"
                         if match.classification == PLUGIN_VERIFIED
-                        else "text-like payload; plugin-specific rule required"
+                        else (
+                            f"source flow {discovery.classification}: {discovery.sink or discovery.unresolved_reason}"
+                            if discovery is not None
+                            else "text-like payload; plugin-specific rule required"
+                        )
                     )
+                    value = _discovery_payload_value(params[0], match.payload, discovery)
                     self._add(
                         report,
                         counters,
                         code,
                         _candidate(
-                            match.payload,
+                            value,
                             location,
                             code,
                             "[0]",
@@ -387,9 +457,22 @@ class RpgMakerCoverageAuditor:
                             evidence,
                             command_name=_safe_identifier(match.prefix),
                             argument_path="payload",
-                            rule_id=match.rule_id,
+                            rule_id=match.rule_id or ("mv_source_discovery_v1" if discovery else None),
+                            plugin_name=_safe_identifier(discovery.plugin_name) if discovery else None,
+                            plugin_file=discovery.plugin_file if discovery else None,
+                            handler_evidence=discovery.handler_kind if discovery else None,
+                            consumed_arguments=discovery.consumed_arguments if discovery else (),
+                            argument_mode=discovery.argument_mode if discovery else None,
+                            helper_chain=discovery.helper_chain if discovery else (),
+                            sink=discovery.sink if discovery else None,
+                            confidence=discovery.confidence if discovery else None,
+                            space_policy=discovery.space_policy if discovery else None,
+                            unresolved_reason=discovery.unresolved_reason if discovery else None,
                         ),
-                        current=match.classification == PLUGIN_VERIFIED,
+                        current=(
+                            match.classification == PLUGIN_VERIFIED
+                            or (discovery is not None and discovery.classification == APPLY_VERIFIED)
+                        ),
                     )
             elif code == 357:
                 plugin = _safe_identifier(params[0]) if len(params) > 0 else None
@@ -544,6 +627,7 @@ class RpgMakerCoverageAuditor:
             "plugin_command_coverage": _plugin_command_statistics(
                 report,
                 self._mv_plugin_prefix_counts,
+                self._discovery_by_command,
             ),
             "script_candidates": sum(item.command_code in {355, 655, 122} for item in report.candidates),
             "mirror_mismatches": sum(item.values_match is False for item in report.mirrors),
@@ -556,8 +640,8 @@ class RpgMakerCoverageAuditor:
         }
 
 
-def _data_files(game: Path) -> list[Path]:
-    data = game / "data"
+def _data_files(game: Path, data_directory: Path | None = None) -> list[Path]:
+    data = data_directory.resolve() if data_directory is not None else game / "data"
     if not data.is_dir():
         raise ValueError("data directory does not exist")
     if _is_linklike(data):
@@ -670,6 +754,7 @@ def _value_shape(value: Any, depth: int = 0) -> str:
 def _plugin_command_statistics(
     report: RpgMakerCoverageReport,
     mv_prefix_counts: Counter[tuple[str, str, str]],
+    discovery_by_command: dict[str, MvPluginDiscovery],
 ) -> dict[str, Any]:
     mv = Counter(
         item.classification
@@ -706,12 +791,13 @@ def _plugin_command_statistics(
             "conditional": mv[Class.CONDITIONAL_TRANSLATABLE.value],
             "internal": mv_row["internal_strings"] if mv_row else 0,
             "prefixes": [
-                {
-                    "prefix": prefix,
-                    "rule_id": None if rule == "<none>" else rule,
-                    "classification": classification,
-                    "count": count,
-                }
+                _mv_prefix_statistics_row(
+                    prefix,
+                    rule,
+                    classification,
+                    count,
+                    discovery_by_command,
+                )
                 for (prefix, rule, classification), count in sorted(
                     mv_prefix_counts.items()
                 )
@@ -738,6 +824,82 @@ def _plugin_command_statistics(
             "standalone": standalone,
         },
     }
+
+
+def _mv_prefix_statistics_row(
+    prefix: str,
+    rule: str,
+    classification: str,
+    count: int,
+    discovery_by_command: dict[str, MvPluginDiscovery],
+) -> dict[str, object]:
+    discovery = next(
+        (
+            item for command, item in discovery_by_command.items()
+            if (
+                (_safe_identifier(command) or "<unknown>") == prefix
+                or (
+                    item.command_normalization in {"upper", "lower"}
+                    and (_safe_identifier(command) or "<unknown>").casefold() == prefix.casefold()
+                )
+            )
+        ),
+        None,
+    )
+    return {
+        "prefix": prefix,
+        "occurrence_count": count,
+        "classification": classification,
+        "discovery_classification": discovery.classification if discovery else None,
+        "rule_id": None if rule == "<none>" else rule,
+        "enabled_plugin": discovery.plugin_name if discovery else None,
+        "plugin_file": discovery.plugin_file if discovery else None,
+        "handler_evidence": discovery.handler_kind if discovery else None,
+        "consumed_arguments": list(discovery.consumed_arguments) if discovery else [],
+        "argument_mode": discovery.argument_mode if discovery else None,
+        "helper_chain": list(discovery.helper_chain) if discovery else [],
+        "sink": discovery.sink if discovery else None,
+        "confidence": discovery.confidence if discovery else None,
+        "space_policy": discovery.space_policy if discovery else None,
+        "unresolved_reason": (
+            discovery.unresolved_reason if discovery else
+            "no unique enabled-plugin command handler was resolved"
+        ),
+    }
+
+
+def _effective_mv_classification(
+    fallback: str,
+    discovery: MvPluginDiscovery | None,
+) -> str:
+    if fallback == PLUGIN_VERIFIED:
+        return Class.VERIFIED_TRANSLATABLE.value
+    if fallback == PLUGIN_INTERNAL:
+        return Class.INTERNAL.value
+    if discovery is None:
+        return fallback
+    return {
+        APPLY_VERIFIED: Class.VERIFIED_TRANSLATABLE.value,
+        DISCOVERED_VERIFIED: Class.CONDITIONAL_TRANSLATABLE.value,
+        DISCOVERY_INTERNAL: Class.INTERNAL.value,
+        DISCOVERY_UNSAFE: Class.UNSAFE.value,
+        DISCOVERY_UNKNOWN: Class.UNKNOWN.value,
+    }.get(discovery.classification, fallback)
+
+
+def _discovery_payload_value(
+    raw: str,
+    fallback_payload: str,
+    discovery: MvPluginDiscovery | None,
+) -> str:
+    if discovery is None:
+        return fallback_payload
+    payload = extract_runtime_payload(
+        raw,
+        discovery.argument_mode,
+        discovery.payload_start,
+    )
+    return payload.payload if payload is not None else fallback_payload
 
 
 _MOVE_NAMES = {
@@ -923,9 +1085,13 @@ _DB_RULES = (
 )
 
 
-def _database_inventory(game: Path, issues: list[AuditIssue]) -> list[DatabaseFieldObservation]:
+def _database_inventory(
+    game: Path,
+    issues: list[AuditIssue],
+    data_directory: Path | None = None,
+) -> list[DatabaseFieldObservation]:
     documents: dict[str, Any] = {}
-    for path in _data_files(game):
+    for path in _data_files(game, data_directory):
         try:
             documents[path.name] = _load_bounded_json(path)
         except Exception:
@@ -1036,7 +1202,7 @@ def _plugin_inventory(game: Path, issues: list[AuditIssue]) -> list[PluginInvent
     return result
 
 
-def _snapshot(game: Path) -> SourceSnapshot:
+def _snapshot(game: Path, data_directory: Path | None = None) -> SourceSnapshot:
     count = 0
     total = 0
     selected_total = 0
@@ -1056,8 +1222,10 @@ def _snapshot(game: Path) -> SourceSnapshot:
             size = path.stat().st_size
             total += size
             relative = path.relative_to(game).as_posix()
+            flat_data = data_directory is not None and path.parent.resolve() == data_directory.resolve()
             if (
                 (relative.startswith("data/") and relative.endswith(".json"))
+                or (flat_data and relative.endswith(".json"))
                 or relative == "js/plugins.js"
                 or (relative.startswith("js/plugins/") and relative.endswith(".js"))
             ):
@@ -1090,12 +1258,13 @@ def write_candidate_csv(path: Path, report: RpgMakerCoverageReport) -> Path:
     if path.exists():
         raise FileExistsError(f"RPG Maker candidate CSV already exists: {path}")
     stream = io.StringIO(newline="")
-    fields = ["file", "json_path", "event_context", "command_index", "command_code", "parameter_path", "classification", "role", "evidence", "value_sha256", "value_length", "hiragana", "katakana", "cjk_kanji", "control_codes", "plugin_name", "command_name", "argument_path", "rule_id", "display_api"]
+    fields = ["file", "json_path", "event_context", "command_index", "command_code", "parameter_path", "classification", "role", "evidence", "value_sha256", "value_length", "hiragana", "katakana", "cjk_kanji", "control_codes", "plugin_name", "command_name", "argument_path", "rule_id", "plugin_file", "handler_evidence", "consumed_arguments", "argument_mode", "helper_chain", "sink", "confidence", "space_policy", "unresolved_reason", "display_api"]
     writer = csv.DictWriter(stream, fieldnames=fields)
     writer.writeheader()
     for item in report.candidates:
         row = {field: getattr(item, field) for field in fields}
-        row["control_codes"] = json.dumps(item.control_codes, ensure_ascii=False)
+        for field in ("control_codes", "consumed_arguments", "helper_chain"):
+            row[field] = json.dumps(getattr(item, field), ensure_ascii=False)
         writer.writerow(row)
     _atomic_new_bytes(path, stream.getvalue().encode("utf-8-sig"))
     return path

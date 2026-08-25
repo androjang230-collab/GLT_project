@@ -27,6 +27,7 @@ from engines.rpgmaker.extractor import RpgMakerExtractor, find_control_codes
 from engines.rpgmaker.plugin_rules import (
     VERIFIED,
     classify_mv_command,
+    extract_runtime_payload,
     parse_editor_annotation,
     rebuild_editor_annotation,
 )
@@ -459,6 +460,19 @@ class RpgMakerInserter:
                     )
                 )
                 continue
+            if (
+                canonical.extra_metadata.get("space_policy") == "requires_protection"
+                and re.search(r"[ \t\r\n]", record.translation)
+            ):
+                report.issues.append(
+                    _record_issue(
+                        record,
+                        severity="error",
+                        code="PLUGIN_ARGUMENT_SPACE_UNSAFE",
+                        reason="single-token plugin argument cannot safely contain ordinary whitespace",
+                    )
+                )
+                continue
             scripts = detect_japanese_scripts(record.translation)
             is_allowlisted = allowlist is not None and allowlist.allows(
                 record.translation
@@ -759,7 +773,7 @@ def _build_storage_plan(
             record, canonical, path_tokens, storage_value, record.translation
         )
 
-    if metadata.get("classification") != "verified":
+    if metadata.get("classification") not in {"verified", "apply_verified"}:
         report.issues.append(
             _record_issue(
                 record,
@@ -771,6 +785,45 @@ def _build_storage_plan(
         return None
 
     if canonical.parameter_index == 0 and ":cmd356:" in canonical.id:
+        if metadata.get("plugin_rule") == "mv_source_discovery_v1":
+            argument_mode = metadata.get("argument_mode")
+            payload_start = metadata.get("payload_start")
+            if not isinstance(argument_mode, str) or (
+                payload_start is not None and not isinstance(payload_start, int)
+            ):
+                report.issues.append(
+                    _record_issue(record, severity="error", code="PLUGIN_RULE_INVALID", reason="discovered payload metadata is invalid")
+                )
+                return None
+            payload = extract_runtime_payload(storage_value, argument_mode, payload_start)
+            expected_command = metadata.get("plugin_command")
+            normalization = metadata.get("command_normalization", "exact")
+            command_matches = (
+                isinstance(expected_command, str)
+                and payload is not None
+                and (
+                    payload.command == expected_command
+                    if normalization == "exact"
+                    else payload.command.upper() == expected_command
+                    if normalization == "upper"
+                    else payload.command.lower() == expected_command
+                    if normalization == "lower"
+                    else False
+                )
+            )
+            if (
+                payload is None
+                or not command_matches
+                or payload.payload != record.original
+            ):
+                report.issues.append(
+                    _record_issue(record, severity="conflict", code="PLUGIN_CONTEXT_MISMATCH", reason="discovered MV command or payload no longer matches")
+                )
+                return None
+            return _ValidatedRecord(
+                record, canonical, path_tokens, storage_value,
+                payload.rebuild(storage_value, record.translation),
+            )
         match = classify_mv_command(storage_value)
         if (
             match.classification != VERIFIED

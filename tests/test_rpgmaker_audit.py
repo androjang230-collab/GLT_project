@@ -166,6 +166,25 @@ class RpgMakerCoverageAuditTests(unittest.TestCase):
         self.assertEqual((r"\C[2]",), item.control_codes)
         self.assertEqual("CONDITIONAL_TRANSLATABLE", item.classification)
 
+    def test_mv_source_discovery_metadata_is_linked_to_observed_prefix(self) -> None:
+        game = _game(self.workspace, EngineId.RPGMAKER_MV)
+        _write_json(game, "Map001.json", _map([_command(356, ["Notice old words"])]))
+        (game / "js/plugins.js").write_text(
+            'var $plugins = [{"name":"NoticePlugin","status":true,"description":"","parameters":{}}];',
+            encoding="utf-8",
+        )
+        (game / "js/plugins/NoticePlugin.js").write_text("""
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ if (command === 'Notice') { $gameMessage.add(args.join(' ')); }
+};
+""", encoding="utf-8")
+        report = RpgMakerCoverageAuditor(EngineId.RPGMAKER_MV).audit(game)
+        row = next(item for item in report.statistics["plugin_command_coverage"]["mv_356"]["prefixes"] if item["prefix"] == "Notice")
+        self.assertEqual("APPLY_VERIFIED", row["discovery_classification"])
+        self.assertEqual("joined_remainder", row["argument_mode"])
+        self.assertEqual("$gameMessage.add", row["sink"])
+        self.assertTrue(report.plugin_discovery["source_unchanged"])
+
     def test_mz_357_recursively_observes_nested_arguments(self) -> None:
         report = self._audit([_command(357, ["LogPlugin", "addLog", "Add Log", {"text": "表示文", "nested": {"lines": ["一", "二"]}, "count": 3}])])
         self.assertEqual(3, len(report.candidates))
@@ -330,8 +349,37 @@ PluginManager.registerCommand('AuditPlugin', 'addLog', args => {});
                 "--csv", str(csv_path),
             ])
         self.assertEqual(0, code)
-        self.assertEqual("0.8.3", json.loads(report_path.read_text(encoding="utf-8"))["tool_version"])
+        self.assertEqual("0.8.4", json.loads(report_path.read_text(encoding="utf-8"))["tool_version"])
         self.assertTrue(csv_path.read_text(encoding="utf-8-sig").startswith("file,json_path,"))
+
+    def test_cli_accepts_external_read_only_plugin_evidence(self) -> None:
+        game = _game(self.workspace, EngineId.RPGMAKER_MV)
+        _write_json(game, "Map001.json", _map([_command(356, ["External text"])]))
+        evidence = self.workspace / "evidence"
+        sources = evidence / "plugins"
+        sources.mkdir(parents=True)
+        config = evidence / "plugins.js"
+        config.write_text(
+            'var $plugins = [{"name":"External","status":true,"description":"","parameters":{}}];',
+            encoding="utf-8",
+        )
+        (sources / "External.js").write_text("""
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ if (command === 'External') { $gameMessage.add(args[0]); }
+};
+""", encoding="utf-8")
+        before = {path.relative_to(evidence): path.read_bytes() for path in evidence.rglob("*") if path.is_file()}
+        report_path = self.workspace / "external-audit.json"
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = glt.main([
+                "rpgmaker-audit", str(game), "--plugins-config", str(config),
+                "--plugin-source", str(sources), "--report", str(report_path),
+            ])
+        after = {path.relative_to(evidence): path.read_bytes() for path in evidence.rglob("*") if path.is_file()}
+        self.assertEqual(0, code)
+        self.assertEqual(before, after)
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, payload["plugin_discovery"]["enabled_plugin_count"])
 
 
 if __name__ == "__main__":

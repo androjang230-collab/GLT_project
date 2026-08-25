@@ -167,6 +167,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="new hash-only candidate CSV outside the game directory",
     )
+    rpgmaker_audit_parser.add_argument(
+        "--plugins-config",
+        type=Path,
+        help="optional external MV plugins.js used read-only",
+    )
+    rpgmaker_audit_parser.add_argument(
+        "--plugin-source",
+        type=Path,
+        help="optional external MV plugin source directory used read-only",
+    )
 
     archive_parser = subparsers.add_parser(
         "inspect-archive",
@@ -662,7 +672,19 @@ def _handle_rpgmaker_audit(
         if report_file is not None and report_file == csv_file:
             raise ValueError("audit report and candidate CSV paths must be different")
 
-        report = RpgMakerCoverageAuditor(detection.engine).audit(game_directory)
+        plugin_config = (
+            resolve_input_file(args.plugins_config)
+            if args.plugins_config is not None else None
+        )
+        plugin_source = (
+            resolve_input_directory(args.plugin_source)
+            if args.plugin_source is not None else None
+        )
+        report = RpgMakerCoverageAuditor(
+            detection.engine,
+            plugin_config_file=plugin_config,
+            plugin_source_directory=plugin_source,
+        ).audit(game_directory)
         if report_file is not None:
             write_coverage_report(report_file, report)
         if csv_file is not None:
@@ -690,6 +712,17 @@ def _handle_rpgmaker_audit(
     for name, count in stats["classification_counts"].items():
         print(f"- {name}: {count}")
     print(f"Plugin candidates: {stats['plugin_candidates']}")
+    if report.plugin_discovery:
+        discovery = report.plugin_discovery
+        classes = discovery.get("classification_counts", {})
+        print(
+            "MV plugin discovery: "
+            f"{discovery.get('plugin_command_handler_count', 0)} handler(s), "
+            f"APPLY_VERIFIED={classes.get('APPLY_VERIFIED', 0)}, "
+            f"DISCOVERED_VERIFIED={classes.get('DISCOVERED_VERIFIED', 0)}, "
+            f"INTERNAL={classes.get('INTERNAL', 0)}, "
+            f"UNKNOWN={classes.get('UNKNOWN', 0)}"
+        )
     print(f"Script candidates: {stats['script_candidates']}")
     database = stats["database_coverage"]
     print(
