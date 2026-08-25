@@ -330,7 +330,7 @@ PluginManager.registerCommand('AuditPlugin', 'addLog', args => {});
                 "--csv", str(csv_path),
             ])
         self.assertEqual(0, code)
-        self.assertEqual("0.8.2", json.loads(report_path.read_text(encoding="utf-8"))["tool_version"])
+        self.assertEqual("0.8.3", json.loads(report_path.read_text(encoding="utf-8"))["tool_version"])
         self.assertTrue(csv_path.read_text(encoding="utf-8-sig").startswith("file,json_path,"))
 
 

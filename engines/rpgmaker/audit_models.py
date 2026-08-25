@@ -44,6 +44,7 @@ class StringCandidate:
     plugin_name: str | None = None
     command_name: str | None = None
     argument_path: str | None = None
+    rule_id: str | None = None
     display_api: str | None = None
 
 

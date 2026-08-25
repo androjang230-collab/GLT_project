@@ -31,6 +31,13 @@ from engines.rpgmaker.audit_models import (
     TranslationClassification as Class,
 )
 from engines.rpgmaker.extractor import find_control_codes
+from engines.rpgmaker.plugin_rules import (
+    INTERNAL as PLUGIN_INTERNAL,
+    VERIFIED as PLUGIN_VERIFIED,
+    classify_mv_command,
+    iter_mz_argument_texts,
+    parse_editor_annotation,
+)
 from engines.rpgmaker.validator import detect_japanese_scripts
 
 
@@ -230,9 +237,11 @@ class RpgMakerCoverageAuditor:
         if engine not in {EngineId.RPGMAKER_MV, EngineId.RPGMAKER_MZ}:
             raise ValueError(f"unsupported engine: {engine}")
         self.engine = engine
+        self._mv_plugin_prefix_counts: Counter[tuple[str, str, str]] = Counter()
 
     def audit(self, game_directory: Path) -> RpgMakerCoverageReport:
         game_directory = game_directory.resolve()
+        self._mv_plugin_prefix_counts.clear()
         before = _snapshot(game_directory)
         report = RpgMakerCoverageReport(
             tool_version=TOOL_VERSION,
@@ -350,18 +359,72 @@ class RpgMakerCoverageAuditor:
                 evidence = "display API pattern; candidate detection only" if display else "evaluated JavaScript; semantics unknown"
                 self._add(report, counters, code, _candidate(params[0], location, code, "[0]", classification, "script", evidence, display_api=display.group(0) if display else None))
             elif code == 356 and params and _text(params[0]):
-                prefix, payload = _mv_plugin_parts(params[0])
-                value = payload if payload else params[0]
-                self._add(report, counters, code, _candidate(value, location, code, "[0]", Class.CONDITIONAL_TRANSLATABLE, "mv_plugin_payload", "raw whitespace-tokenized plugin command; rule required", command_name=_safe_identifier(prefix)))
+                match = classify_mv_command(params[0])
+                safe_prefix = _safe_identifier(match.prefix) or "<unknown>"
+                self._mv_plugin_prefix_counts[
+                    (safe_prefix, match.rule_id or "<none>", match.classification)
+                ] += 1
+                if match.classification == PLUGIN_INTERNAL:
+                    counters[code][Class.INTERNAL.value] += 1
+                else:
+                    classification = Class(match.classification)
+                    evidence = (
+                        f"verified rule {match.rule_id}; payload only"
+                        if match.classification == PLUGIN_VERIFIED
+                        else "text-like payload; plugin-specific rule required"
+                    )
+                    self._add(
+                        report,
+                        counters,
+                        code,
+                        _candidate(
+                            match.payload,
+                            location,
+                            code,
+                            "[0]",
+                            classification,
+                            "mv_plugin_payload",
+                            evidence,
+                            command_name=_safe_identifier(match.prefix),
+                            argument_path="payload",
+                            rule_id=match.rule_id,
+                        ),
+                        current=match.classification == PLUGIN_VERIFIED,
+                    )
             elif code == 357:
                 plugin = _safe_identifier(params[0]) if len(params) > 0 else None
                 command_name = _safe_identifier(params[1]) if len(params) > 1 else None
-                if len(params) > 2 and isinstance(params[2], str):
-                    counters[code][Class.INTERNAL.value] += 1
+                counters[code][Class.INTERNAL.value] += sum(
+                    isinstance(params[index], str) and bool(params[index])
+                    for index in range(min(3, len(params)))
+                )
                 if len(params) > 3:
-                    for arg_path, value in _iter_strings(params[3], path="[3]"):
-                        if _text(value):
-                            self._add(report, counters, code, _candidate(value, location, code, arg_path, Class.CONDITIONAL_TRANSLATABLE, "mz_plugin_argument", "structured plugin argument; plugin-specific rule required", plugin_name=plugin, command_name=command_name, argument_path=arg_path[3:] or "$"))
+                    for match in iter_mz_argument_texts(plugin or "", command_name or "", params[3]):
+                        classification = Class(match.classification)
+                        evidence = (
+                            f"verified rule {match.rule_id}; selected argument only"
+                            if match.classification == PLUGIN_VERIFIED
+                            else "text-like structured argument; plugin-specific rule required"
+                        )
+                        self._add(
+                            report,
+                            counters,
+                            code,
+                            _candidate(
+                                match.value,
+                                location,
+                                code,
+                                f"[3].{match.path}",
+                                classification,
+                                "mz_plugin_argument",
+                                evidence,
+                                plugin_name=plugin,
+                                command_name=command_name,
+                                argument_path=f".{match.path}",
+                                rule_id=match.rule_id,
+                            ),
+                            current=match.classification == PLUGIN_VERIFIED,
+                        )
             elif code == 657 and params and _text(params[0]):
                 self._observe_plugin_annotation(report, counters, params[0], location, command_list)
             elif code == 205:
@@ -428,18 +491,39 @@ class RpgMakerCoverageAuditor:
                 break
             source_index -= 1
         related = source_index >= 0
-        report.mirrors.append(MirrorObservation(location.file, location.context, source_index if related else None, location.index, 357, 657, None, "MZ editor annotation; no stock runtime handler", "CONFIRMED" if related else "INFERRED", None))
-        self._add(report, counters, 657, _candidate(value, location, 657, "[0]", Class.MIRROR, "plugin_command_annotation", "editor annotation; canonical plugin argument remains code 357"))
+        values_match: bool | None = None
+        parsed = parse_editor_annotation(value)
+        if related and parsed is not None:
+            source = commands[source_index]
+            source_params = source.get("parameters", [])
+            args = source_params[3] if len(source_params) > 3 else None
+            if isinstance(args, dict) and isinstance(args.get(parsed[0]), str):
+                values_match = args[parsed[0]] == parsed[1]
+        relation = "matched editor mirror" if values_match is True else (
+            "mismatched editor mirror" if values_match is False else
+            ("unresolved editor annotation" if related else "standalone editor annotation")
+        )
+        report.mirrors.append(MirrorObservation(location.file, location.context, source_index if related else None, location.index, 357, 657, None, relation, "CONFIRMED" if related else "INFERRED", values_match))
+        classification = Class.MIRROR if related else Class.INTERNAL
+        self._add(report, counters, 657, _candidate(value, location, 657, "[0]", classification, "plugin_command_annotation", "editor annotation only; never an independent translation entry"))
 
-    @staticmethod
     def _finish_statistics(
+        self,
         report: RpgMakerCoverageReport,
         command_total: int,
         file_code_counts: dict[str, Counter[int]],
     ) -> None:
         class_counts = Counter(item.classification for item in report.candidates)
+        represented_internal = Counter(
+            item.command_code
+            for item in report.candidates
+            if item.classification == Class.INTERNAL.value
+        )
         for row in report.event_commands:
-            class_counts[Class.INTERNAL.value] += row.get("internal_strings", 0)
+            class_counts[Class.INTERNAL.value] += max(
+                0,
+                row.get("internal_strings", 0) - represented_internal[row["code"]],
+            )
         current = sum(row["current_extracted_entries"] for row in report.event_commands)
         verified = class_counts[Class.VERIFIED_TRANSLATABLE.value]
         report.statistics = {
@@ -457,6 +541,10 @@ class RpgMakerCoverageAuditor:
             },
             "database_coverage": _database_coverage(report.database_fields),
             "plugin_candidates": sum(item.command_code in {356, 357} for item in report.candidates),
+            "plugin_command_coverage": _plugin_command_statistics(
+                report,
+                self._mv_plugin_prefix_counts,
+            ),
             "script_candidates": sum(item.command_code in {355, 655, 122} for item in report.candidates),
             "mirror_mismatches": sum(item.values_match is False for item in report.mirrors),
             "errors": sum(item.severity == "error" for item in report.issues),
@@ -579,9 +667,77 @@ def _value_shape(value: Any, depth: int = 0) -> str:
     return {str: "str", int: "int", float: "float", bool: "bool", type(None): "null"}.get(type(value), type(value).__name__)
 
 
-def _mv_plugin_parts(raw: str) -> tuple[str, str]:
-    match = re.match(r"\s*(\S+)(?:\s+([\s\S]*))?$", raw)
-    return (match.group(1), match.group(2) or "") if match else ("", raw)
+def _plugin_command_statistics(
+    report: RpgMakerCoverageReport,
+    mv_prefix_counts: Counter[tuple[str, str, str]],
+) -> dict[str, Any]:
+    mv = Counter(
+        item.classification
+        for item in report.candidates
+        if item.command_code == 356
+    )
+    mz = Counter(
+        (
+            item.plugin_name or "<unknown>",
+            item.command_name or "<unknown>",
+            item.argument_path or "$",
+            item.classification,
+        )
+        for item in report.candidates
+        if item.command_code == 357
+    )
+    mirrors = Counter(
+        "matched" if item.values_match is True else
+        "mismatched" if item.values_match is False else
+        "unknown"
+        for item in report.mirrors
+        if item.mirror_code == 657
+    )
+    standalone = sum(
+        item.mirror_code == 657 and item.source_command_index is None
+        for item in report.mirrors
+    )
+    mv_row = next((row for row in report.event_commands if row["code"] == 356), None)
+    mz_row = next((row for row in report.event_commands if row["code"] == 357), None)
+    return {
+        "mv_356": {
+            "occurrences": mv_row["occurrences"] if mv_row else 0,
+            "verified": mv[Class.VERIFIED_TRANSLATABLE.value],
+            "conditional": mv[Class.CONDITIONAL_TRANSLATABLE.value],
+            "internal": mv_row["internal_strings"] if mv_row else 0,
+            "prefixes": [
+                {
+                    "prefix": prefix,
+                    "rule_id": None if rule == "<none>" else rule,
+                    "classification": classification,
+                    "count": count,
+                }
+                for (prefix, rule, classification), count in sorted(
+                    mv_prefix_counts.items()
+                )
+            ],
+        },
+        "mz_357": {
+            "occurrences": mz_row["occurrences"] if mz_row else 0,
+            "arguments": [
+                {
+                    "plugin_name": plugin,
+                    "plugin_command": command,
+                    "argument_path": path,
+                    "classification": classification,
+                    "count": count,
+                }
+                for (plugin, command, path, classification), count in sorted(mz.items())
+            ],
+            "internal_strings": mz_row["internal_strings"] if mz_row else 0,
+        },
+        "code_657": {
+            "matched": mirrors["matched"],
+            "mismatched": mirrors["mismatched"],
+            "unknown": mirrors["unknown"],
+            "standalone": standalone,
+        },
+    }
 
 
 _MOVE_NAMES = {
@@ -934,7 +1090,7 @@ def write_candidate_csv(path: Path, report: RpgMakerCoverageReport) -> Path:
     if path.exists():
         raise FileExistsError(f"RPG Maker candidate CSV already exists: {path}")
     stream = io.StringIO(newline="")
-    fields = ["file", "json_path", "event_context", "command_index", "command_code", "parameter_path", "classification", "role", "evidence", "value_sha256", "value_length", "hiragana", "katakana", "cjk_kanji", "control_codes", "plugin_name", "command_name", "argument_path", "display_api"]
+    fields = ["file", "json_path", "event_context", "command_index", "command_code", "parameter_path", "classification", "role", "evidence", "value_sha256", "value_length", "hiragana", "katakana", "cjk_kanji", "control_codes", "plugin_name", "command_name", "argument_path", "rule_id", "display_api"]
     writer = csv.DictWriter(stream, fieldnames=fields)
     writer.writeheader()
     for item in report.candidates:

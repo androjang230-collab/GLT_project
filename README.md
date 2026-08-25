@@ -1,7 +1,7 @@
 # Game Localization Toolkit (GLT)
 
 Windows 11에서 일본 동인게임의 번역 가능한 문자열을 안전하게 다루기 위한
-개인용 Python 도구입니다. 현재 버전은 **GLT 0.8.2**이며 RPG Maker MV/MZ의
+개인용 Python 도구입니다. 현재 버전은 **GLT 0.8.3**이며 RPG Maker MV/MZ의
 엔진 감지, UTF-8 JSONL 추출, 별도 폴더 안전 적용, 독립 QA, dry-run,
 fingerprint와 이식 가능한 번역 Project, 사용자 Glossary 및 JSONL Translation
 Memory, 폰트 진단과 안전한 기본 폰트 패치를 구현합니다. 대용량 번역 JSONL은
@@ -966,3 +966,19 @@ split/merge 흐름을 그대로 사용합니다.
 기존 RPG Maker Project는 pre-Classes fingerprint도 검증된 legacy fingerprint로
 인식하므로 schema migration 없이 계속 사용할 수 있습니다. Plugin command,
 script, move-route, 102/402 synchronization은 이번 버전에 포함되지 않습니다.
+
+## 0.8.3 RPG Maker plugin text coverage
+
+MV event code `356`은 검증된 `インフォ表示` 명령의 payload만 번역 단위로
+추출하며 apply 시 원래 명령 prefix와 공백을 그대로 재조립합니다. `P_SHAKE`,
+`P_SPIN_RELATIVE`, `D_TEXT_SETTING`과 비텍스트 payload는 internal로 유지하고,
+그 밖의 text-like payload는 audit의 conditional candidate로만 노출합니다.
+
+MZ event code `357`은 `MNKR_TMLogWindowMZ` / `addLog` /
+`parameters[3].text` 규칙만 자동 추출·QA·apply에 연결합니다. 다른 text-like
+argument는 bounded audit candidate이며 plugin name, command와 argument path를
+기록합니다. 뒤따르는 code `657`의 `text = ...` annotation이 원문과 정확히
+일치할 때만 함께 갱신하고, 불일치 annotation은 보존하면서 warning을 냅니다.
+standalone `657`은 번역 단위가 아닙니다. 자세한 규칙과 검증 결과는
+[RPG Maker plugin text coverage](docs/rpgmaker_plugin_text_coverage_0.8.3.md)에
+정리되어 있습니다.

@@ -15,6 +15,11 @@ from core.models import (
     TranslationEntry,
 )
 from core.translation_io import write_jsonl
+from engines.rpgmaker.plugin_rules import (
+    VERIFIED,
+    classify_mv_command,
+    iter_mz_argument_texts,
+)
 
 
 _MAP_FILE_PATTERN = re.compile(r"Map(\d+)\.json", re.IGNORECASE)
@@ -500,6 +505,68 @@ class RpgMakerExtractor:
                         page_id=page_id,
                     )
                 )
+            elif code == 356 and parameters and _is_text(parameters[0]):
+                match = classify_mv_command(parameters[0])
+                if match.classification == VERIFIED:
+                    entries.append(
+                        self._command_entry(
+                            file_name=file_name,
+                            context_id=context_id,
+                            code=356,
+                            command_index=command_index,
+                            parameter_index=0,
+                            text=match.payload,
+                            text_type="plugin_text",
+                            json_path=f"{json_prefix}[{command_index}].parameters[0]",
+                            event_id=event_id,
+                            page_id=page_id,
+                            extra_metadata={
+                                "source_kind": "plugin_command",
+                                "classification": "verified",
+                                "plugin_command": match.prefix,
+                                "argument_path": "payload",
+                                "plugin_rule": match.rule_id,
+                            },
+                        )
+                    )
+            elif code == 357 and len(parameters) > 3:
+                plugin_name = parameters[0] if isinstance(parameters[0], str) else ""
+                plugin_command = parameters[1] if isinstance(parameters[1], str) else ""
+                for match in iter_mz_argument_texts(
+                    plugin_name,
+                    plugin_command,
+                    parameters[3],
+                ):
+                    if match.classification != VERIFIED:
+                        continue
+                    argument_suffix = _argument_json_suffix(match.path)
+                    entries.append(
+                        self._entry(
+                            entry_id=(
+                                f"{context_id}:cmd357:index{command_index}:param3:"
+                                f"arg:{match.path}"
+                            ),
+                            file_name=file_name,
+                            text=match.value,
+                            text_type="plugin_text",
+                            json_path=(
+                                f"{json_prefix}[{command_index}].parameters[3]"
+                                f"{argument_suffix}"
+                            ),
+                            event_id=event_id,
+                            page_id=page_id,
+                            command_index=command_index,
+                            parameter_index=3,
+                            extra_metadata={
+                                "source_kind": "plugin_command",
+                                "classification": "verified",
+                                "plugin_name": plugin_name,
+                                "plugin_command": plugin_command,
+                                "argument_path": match.path,
+                                "plugin_rule": match.rule_id,
+                            },
+                        )
+                    )
         return entries
 
     def _command_entry(
@@ -516,6 +583,7 @@ class RpgMakerExtractor:
         event_id: int,
         page_id: int | None,
         speaker: str | None = None,
+        extra_metadata: dict[str, object] | None = None,
     ) -> TranslationEntry:
         return self._entry(
             entry_id=(
@@ -530,6 +598,7 @@ class RpgMakerExtractor:
             page_id=page_id,
             command_index=command_index,
             parameter_index=parameter_index,
+            extra_metadata=extra_metadata,
         )
 
     def _extract_database(
@@ -662,6 +731,7 @@ class RpgMakerExtractor:
         page_id: int | None = None,
         command_index: int | None = None,
         parameter_index: int | None = None,
+        extra_metadata: dict[str, object] | None = None,
     ) -> TranslationEntry:
         return TranslationEntry(
             id=entry_id,
@@ -676,7 +746,16 @@ class RpgMakerExtractor:
             command_index=command_index,
             parameter_index=parameter_index,
             control_codes=find_control_codes(text),
+            extra_metadata=extra_metadata or {},
         )
+
+
+def _argument_json_suffix(path: str) -> str:
+    """Convert a rule path such as ``nested.lines[0]`` to JSONPath syntax."""
+
+    if not path:
+        return ""
+    return "." + path
 
 
 def _is_text(value: Any) -> bool:

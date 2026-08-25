@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -23,6 +24,12 @@ from core.models import (
 )
 from core.version import SCHEMA_VERSION, TOOL_VERSION
 from engines.rpgmaker.extractor import RpgMakerExtractor, find_control_codes
+from engines.rpgmaker.plugin_rules import (
+    VERIFIED,
+    classify_mv_command,
+    parse_editor_annotation,
+    rebuild_editor_annotation,
+)
 from engines.rpgmaker.validator import (
     JapaneseAllowlist,
     JsonPathError,
@@ -57,6 +64,17 @@ class _ValidatedRecord:
     record: TranslationRecord
     canonical: TranslationEntry
     path_tokens: tuple[JsonPathToken, ...]
+    expected_storage_value: str
+    replacement_value: str
+    mirror_updates: tuple["_MirrorUpdate", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _MirrorUpdate:
+    json_path: str
+    path_tokens: tuple[JsonPathToken, ...]
+    expected: str
+    replacement: str
 
 
 @dataclass(slots=True)
@@ -287,6 +305,7 @@ class RpgMakerInserter:
                 )
             )
         canonical_by_id = {entry.id: entry for entry in extraction.entries}
+        documents: dict[str, Any] = {}
 
         validated: list[_ValidatedRecord] = []
         for record in records:
@@ -471,13 +490,16 @@ class RpgMakerInserter:
                         ),
                     )
                 )
-            validated.append(
-                _ValidatedRecord(
-                    record=record,
-                    canonical=canonical,
-                    path_tokens=path_tokens,
-                )
+            plan = _build_storage_plan(
+                game_directory,
+                record,
+                canonical,
+                path_tokens,
+                documents,
+                report,
             )
+            if plan is not None:
+                validated.append(plan)
         return validated
 
     @staticmethod
@@ -523,7 +545,7 @@ class RpgMakerInserter:
                         )
                     )
                     continue
-                if current_value != validated.record.original:
+                if current_value != validated.expected_storage_value:
                     report.issues.append(
                         _record_issue(
                             validated.record,
@@ -546,9 +568,42 @@ class RpgMakerInserter:
                 set_json_value(
                     document,
                     validated.path_tokens,
-                    validated.record.translation,
+                    validated.replacement_value,
                 )
                 allowed_paths.add(validated.record.json_path)
+                mirror_failed = False
+                for mirror in validated.mirror_updates:
+                    try:
+                        mirror_value = get_json_value(document, mirror.path_tokens)
+                    except JsonPathError:
+                        mirror_failed = True
+                        break
+                    if mirror_value != mirror.expected:
+                        mirror_failed = True
+                        break
+                    set_json_value(document, mirror.path_tokens, mirror.replacement)
+                    allowed_paths.add(mirror.json_path)
+                if mirror_failed:
+                    set_json_value(
+                        document,
+                        validated.path_tokens,
+                        validated.expected_storage_value,
+                    )
+                    for mirror in validated.mirror_updates:
+                        try:
+                            if get_json_value(document, mirror.path_tokens) == mirror.replacement:
+                                set_json_value(document, mirror.path_tokens, mirror.expected)
+                        except JsonPathError:
+                            pass
+                    report.issues.append(
+                        _record_issue(
+                            validated.record,
+                            severity="conflict",
+                            code="PLUGIN_MIRROR_CHANGED",
+                            reason="code 657 mirror changed after preflight; entry was blocked",
+                        )
+                    )
+                    continue
                 applied_records.append(validated)
 
             if not applied_records:
@@ -632,6 +687,191 @@ class RpgMakerInserter:
                 + "\n"
             ).encode("utf-8"),
         )
+
+
+_MZ_COMMAND_PATH = re.compile(
+    r"^(?P<list_path>\$[\s\S]*\.list)\[(?P<index>\d+)\]\.parameters\[3\][\s\S]*$"
+)
+
+
+def _build_storage_plan(
+    game_directory: Path,
+    record: TranslationRecord,
+    canonical: TranslationEntry,
+    path_tokens: tuple[JsonPathToken, ...],
+    documents: dict[str, Any],
+    report: ApplyReport,
+) -> _ValidatedRecord | None:
+    """Resolve virtual plugin payloads and safe editor mirrors read-only."""
+
+    document = documents.get(record.file)
+    if document is None:
+        source = game_directory.joinpath(*PurePosixPath(record.file).parts)
+        try:
+            document = json.loads(source.read_bytes().decode("utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            report.issues.append(
+                _record_issue(
+                    record,
+                    severity="error",
+                    code="MALFORMED_SOURCE_JSON",
+                    reason=str(exc),
+                )
+            )
+            return None
+        documents[record.file] = document
+    try:
+        storage_value = get_json_value(document, path_tokens)
+    except JsonPathError as exc:
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="INVALID_JSON_PATH",
+                reason=str(exc),
+            )
+        )
+        return None
+    if not isinstance(storage_value, str):
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="INVALID_TARGET_TYPE",
+                reason="target value is not a string",
+            )
+        )
+        return None
+
+    metadata = canonical.extra_metadata
+    if metadata.get("source_kind") != "plugin_command":
+        if storage_value != record.original:
+            report.issues.append(
+                _record_issue(
+                    record,
+                    severity="conflict",
+                    code="SOURCE_TEXT_MISMATCH",
+                    reason="current game text differs from JSONL original",
+                )
+            )
+            return None
+        return _ValidatedRecord(
+            record, canonical, path_tokens, storage_value, record.translation
+        )
+
+    if metadata.get("classification") != "verified":
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="UNVERIFIED_PLUGIN_TEXT",
+                reason="conditional plugin text cannot be applied automatically",
+            )
+        )
+        return None
+
+    if canonical.parameter_index == 0 and ":cmd356:" in canonical.id:
+        match = classify_mv_command(storage_value)
+        if (
+            match.classification != VERIFIED
+            or match.payload != record.original
+            or match.prefix != metadata.get("plugin_command")
+        ):
+            report.issues.append(
+                _record_issue(
+                    record,
+                    severity="conflict",
+                    code="PLUGIN_CONTEXT_MISMATCH",
+                    reason="MV plugin prefix or payload no longer matches the verified rule",
+                )
+            )
+            return None
+        return _ValidatedRecord(
+            record,
+            canonical,
+            path_tokens,
+            storage_value,
+            match.rebuild(record.translation),
+        )
+
+    if storage_value != record.original:
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="conflict",
+                code="SOURCE_TEXT_MISMATCH",
+                reason="current plugin argument differs from JSONL original",
+            )
+        )
+        return None
+    mirrors = _find_mz_mirror_updates(
+        document,
+        canonical,
+        record,
+        report,
+    )
+    return _ValidatedRecord(
+        record,
+        canonical,
+        path_tokens,
+        storage_value,
+        record.translation,
+        mirrors,
+    )
+
+
+def _find_mz_mirror_updates(
+    document: Any,
+    canonical: TranslationEntry,
+    record: TranslationRecord,
+    report: ApplyReport,
+) -> tuple[_MirrorUpdate, ...]:
+    match = _MZ_COMMAND_PATH.match(canonical.json_path or "")
+    if match is None:
+        return ()
+    list_path = match.group("list_path")
+    source_index = int(match.group("index"))
+    try:
+        command_list = get_json_value(document, parse_json_path(list_path))
+    except JsonPathError:
+        return ()
+    if not isinstance(command_list, list):
+        return ()
+    argument_path = canonical.extra_metadata.get("argument_path")
+    if not isinstance(argument_path, str):
+        return ()
+    updates: list[_MirrorUpdate] = []
+    for index in range(source_index + 1, len(command_list)):
+        command = command_list[index]
+        if not isinstance(command, dict) or command.get("code") != 657:
+            break
+        parameters = command.get("parameters")
+        if not isinstance(parameters, list) or not parameters or not isinstance(parameters[0], str):
+            continue
+        raw = parameters[0]
+        parsed = parse_editor_annotation(raw)
+        if parsed is None or parsed[0] != argument_path:
+            continue
+        if parsed[1] != record.original:
+            report.issues.append(
+                _record_issue(
+                    record,
+                    severity="warning",
+                    code="PLUGIN_MIRROR_MISMATCH",
+                    reason=f"code 657 annotation at command {index} was preserved",
+                )
+            )
+            continue
+        json_path = f"{list_path}[{index}].parameters[0]"
+        updates.append(
+            _MirrorUpdate(
+                json_path=json_path,
+                path_tokens=parse_json_path(json_path),
+                expected=raw,
+                replacement=rebuild_editor_annotation(raw, record.translation),
+            )
+        )
+    return tuple(updates)
 
 
 def _parse_translation_record(
