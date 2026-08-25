@@ -26,6 +26,7 @@ _CONTROL_CODE_PATTERN = re.compile(
 _ORDERED_DATA_FILES = (
     "CommonEvents.json",
     "Actors.json",
+    "Classes.json",
     "Items.json",
     "Weapons.json",
     "Armors.json",
@@ -42,6 +43,7 @@ _DATABASE_FIELDS: dict[str, tuple[tuple[str, str], ...]] = {
         ("nickname", "actor_nickname"),
         ("profile", "description"),
     ),
+    "Classes.json": (("name", "class_name"),),
     "Items.json": (
         ("name", "item_name"),
         ("description", "description"),
@@ -468,6 +470,32 @@ class RpgMakerExtractor:
                         text=parameters[0],
                         text_type="scroll_text",
                         json_path=f"{json_prefix}[{command_index}].parameters[0]",
+                        event_id=event_id,
+                        page_id=page_id,
+                    )
+                )
+            elif (
+                code in (320, 324, 325)
+                and len(parameters) > 1
+                and _is_text(parameters[1])
+            ):
+                text_type = {
+                    320: "actor_name",
+                    324: "actor_nickname",
+                    325: "description",
+                }[code]
+                entries.append(
+                    self._command_entry(
+                        file_name=file_name,
+                        context_id=context_id,
+                        code=code,
+                        command_index=command_index,
+                        parameter_index=1,
+                        text=parameters[1],
+                        text_type=text_type,
+                        json_path=(
+                            f"{json_prefix}[{command_index}].parameters[1]"
+                        ),
                         event_id=event_id,
                         page_id=page_id,
                     )

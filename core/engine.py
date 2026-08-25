@@ -127,6 +127,16 @@ class EnginePlugin(ABC):
 
         raise self._unsupported("game fingerprinting")
 
+    def accepts_legacy_fingerprint(
+        self,
+        game_directory: Path,
+        engine: "EngineId",
+        expected: str,
+    ) -> bool:
+        """Return whether an older adapter-specific source set matches."""
+
+        return False
+
     def inspect_structure(self, game_directory: Path) -> "StructureReport":
         """Inspect engine-owned files without modifying the game directory."""
 

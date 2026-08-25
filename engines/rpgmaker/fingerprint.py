@@ -32,8 +32,31 @@ def calculate_game_fingerprint(
     )
 
 
+def calculate_legacy_game_fingerprint_0_8_1(
+    game_directory: Path,
+    engine: EngineId,
+) -> GameFingerprint:
+    """Reproduce the pre-Classes fingerprint for existing portable Projects."""
+
+    selected = {
+        path
+        for path in RpgMakerExtractor.source_files(game_directory)
+        if path.name != "Classes.json"
+    }
+    map_infos = game_directory / "data/MapInfos.json"
+    if map_infos.is_file():
+        selected.add(map_infos)
+    return build_content_fingerprint(
+        game_directory,
+        engine,
+        selected,
+        format_tag=b"glt-game-fingerprint-v1\0",
+    )
+
+
 __all__ = [
     "FingerprintFile",
     "GameFingerprint",
     "calculate_game_fingerprint",
+    "calculate_legacy_game_fingerprint_0_8_1",
 ]

@@ -357,7 +357,14 @@ class ProjectManager:
                 )
             )
         current = adapter.fingerprint(game_directory, engine)
-        if context.config.game_fingerprint != current.value:
+        if (
+            context.config.game_fingerprint != current.value
+            and not adapter.accepts_legacy_fingerprint(
+                game_directory,
+                engine,
+                context.config.game_fingerprint,
+            )
+        ):
             issues.append(
                 ApplyIssue(
                     severity="conflict",

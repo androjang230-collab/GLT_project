@@ -114,15 +114,15 @@ class RpgMakerCoverageAuditTests(unittest.TestCase):
         self.assertEqual(5, report.statistics["coverage"]["currently_extracted"])
         self.assertEqual({"speaker", "dialogue", "choice", "scroll_text"}, {item.role for item in report.candidates})
 
-    def test_320_324_325_are_verified_missed_entries(self) -> None:
+    def test_320_324_325_are_now_current_verified_entries(self) -> None:
         report = self._audit([
             _command(320, [1, "新しい名前"]),
             _command(324, [1, "新しい二つ名"]),
             _command(325, [1, "新しいプロフィール"]),
         ])
         coverage = report.statistics["coverage"]
-        self.assertEqual(3, coverage["known_missed_verified_candidates"])
-        self.assertEqual(0, coverage["currently_extracted"])
+        self.assertEqual(0, coverage["known_missed_verified_candidates"])
+        self.assertEqual(3, coverage["currently_extracted"])
 
     def test_comments_and_labels_are_internal_even_with_japanese(self) -> None:
         report = self._audit([
@@ -214,14 +214,14 @@ class RpgMakerCoverageAuditTests(unittest.TestCase):
         ])
         self.assertEqual([], report.candidates)
 
-    def test_database_inventory_identifies_classes_name_gap(self) -> None:
+    def test_database_inventory_marks_classes_name_current(self) -> None:
         game = _game(self.workspace)
         _write_json(game, "Classes.json", [None, {"id": 1, "name": "ClassName", "note": ""}])
         report = RpgMakerCoverageAuditor(EngineId.RPGMAKER_MZ).audit(game)
         row = next(item for item in report.database_fields if item.file == "Classes.json" and item.json_path == "[*].name")
         self.assertEqual(1, row.occurrences)
-        self.assertFalse(row.current_extract)
-        self.assertEqual(1, report.statistics["database_coverage"]["known_missed_verified_candidates"])
+        self.assertTrue(row.current_extract)
+        self.assertEqual(0, report.statistics["database_coverage"]["known_missed_verified_candidates"])
 
     def test_system_visible_and_internal_arrays_are_separated(self) -> None:
         game = _game(self.workspace)
@@ -330,7 +330,7 @@ PluginManager.registerCommand('AuditPlugin', 'addLog', args => {});
                 "--csv", str(csv_path),
             ])
         self.assertEqual(0, code)
-        self.assertEqual("0.8.1", json.loads(report_path.read_text(encoding="utf-8"))["tool_version"])
+        self.assertEqual("0.8.2", json.loads(report_path.read_text(encoding="utf-8"))["tool_version"])
         self.assertTrue(csv_path.read_text(encoding="utf-8-sig").startswith("file,json_path,"))
 
 

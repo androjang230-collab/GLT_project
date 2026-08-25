@@ -98,7 +98,7 @@ class ProjectManagerTests(unittest.TestCase):
         project_text = (self.project / "project.json").read_text(encoding="utf-8")
         config = json.loads(project_text)
         self.assertEqual(1, config["project_version"])
-        self.assertEqual("0.8.1", config["tool_version"])
+        self.assertEqual("0.8.2", config["tool_version"])
         self.assertNotIn(str(self.workspace), project_text)
         self.assertEqual(
             "source,target,type,locked\n",

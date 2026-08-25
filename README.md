@@ -1,7 +1,7 @@
 # Game Localization Toolkit (GLT)
 
 Windows 11에서 일본 동인게임의 번역 가능한 문자열을 안전하게 다루기 위한
-개인용 Python 도구입니다. 현재 버전은 **GLT 0.8.1**이며 RPG Maker MV/MZ의
+개인용 Python 도구입니다. 현재 버전은 **GLT 0.8.2**이며 RPG Maker MV/MZ의
 엔진 감지, UTF-8 JSONL 추출, 별도 폴더 안전 적용, 독립 QA, dry-run,
 fingerprint와 이식 가능한 번역 Project, 사용자 Glossary 및 JSONL Translation
 Memory, 폰트 진단과 안전한 기본 폰트 패치를 구현합니다. 대용량 번역 JSONL은
@@ -170,10 +170,14 @@ RPG Maker MZ는 `js/rmmz_core.js`, MV는 `js/rpg_core.js`를 고유 증거로
 - `401` Show Text 본문
 - `102` Show Choices의 개별 선택지
 - `405` Scroll Text 본문
+- `320` Change Actor Name의 새 이름
+- `324` Change Nickname의 새 별명
+- `325` Change Profile의 새 프로필
 
 DB 파일은 다음 필드만 명시적으로 처리합니다.
 
 - `Actors.json`: `name`, `nickname`, `profile`
+- `Classes.json`: `name`
 - `Items.json`, `Weapons.json`, `Armors.json`: `name`, `description`
 - `Skills.json`: `name`, `description`, `message1`, `message2`
 - `States.json`: `name`, `message1`~`message4`
@@ -949,3 +953,16 @@ python glt.py rpgmaker-audit "D:\Games\Example" `
 356·357·657 및 script 안전성 결론은
 [RPG Maker translation coverage audit](docs/rpgmaker_translation_coverage_0.8.1.md)에
 정리되어 있습니다.
+
+## 0.8.2 RPG Maker standard coverage expansion
+
+0.8.1 audit에서 표준 player-visible text로 확인한 event code `320`
+(Change Actor Name), `324` (Change Nickname), `325` (Change Profile)의
+`parameters[1]`과 `Classes.json`의 `name`을 기존 canonical ID와 DB path 규칙으로
+추가했습니다. 이 항목들은 기존 extract, QA, apply, Project, Glossary, TM 및
+split/merge 흐름을 그대로 사용합니다.
+
+0.8.2 Project fingerprint에는 `Classes.json`이 포함됩니다. 0.8.1 이하에서 만든
+기존 RPG Maker Project는 pre-Classes fingerprint도 검증된 legacy fingerprint로
+인식하므로 schema migration 없이 계속 사용할 수 있습니다. Plugin command,
+script, move-route, 102/402 synchronization은 이번 버전에 포함되지 않습니다.

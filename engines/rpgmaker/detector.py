@@ -11,7 +11,10 @@ from core.models import ApplyReport, DetectionResult, EngineId, ExtractionResult
 from core.qa import QaResult
 from core.paths import portable_relative_path
 from engines.rpgmaker.extractor import RpgMakerExtractor, write_jsonl
-from engines.rpgmaker.fingerprint import calculate_game_fingerprint
+from engines.rpgmaker.fingerprint import (
+    calculate_game_fingerprint,
+    calculate_legacy_game_fingerprint_0_8_1,
+)
 from engines.rpgmaker.inserter import RpgMakerInserter
 from engines.rpgmaker.qa import QaResult, RpgMakerQa
 from engines.rpgmaker.validator import JapaneseAllowlist
@@ -174,6 +177,18 @@ class RpgMakerEngine(EnginePlugin):
         if engine not in self.supported_engines:
             raise ValueError(f"unsupported RPG Maker engine: {engine}")
         return calculate_game_fingerprint(game_directory, engine)
+
+    def accepts_legacy_fingerprint(
+        self,
+        game_directory: Path,
+        engine: EngineId,
+        expected: str,
+    ) -> bool:
+        legacy = calculate_legacy_game_fingerprint_0_8_1(
+            game_directory,
+            engine,
+        )
+        return legacy.value == expected
 
     def font_check(self, game_directory: Path, reports_directory: Path) -> object:
         from engines.rpgmaker.fonts import RpgMakerFontService

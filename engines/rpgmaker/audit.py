@@ -112,8 +112,8 @@ _EVENT_NAMES = dict(
     )
 )
 
-_CURRENT_EVENT_CODES = {101, 401, 102, 405}
-_VERIFIED_EVENT_CODES = _CURRENT_EVENT_CODES | {320, 324, 325}
+_CURRENT_EVENT_CODES = {101, 401, 102, 405, 320, 324, 325}
+_VERIFIED_EVENT_CODES = set(_CURRENT_EVENT_CODES)
 _INTERNAL_STRING_CODES = {108, 408, 118, 119}
 _SCRIPT_CODES = {355, 655}
 _ASSET_STRING_CODES = {
@@ -324,7 +324,21 @@ class RpgMakerCoverageAuditor:
                 self._observe_choice_mirror(report, counters, params, location, command_list)
             elif code in {320, 324, 325} and len(params) > 1 and _text(params[1]):
                 role = {320: "actor_name", 324: "actor_nickname", 325: "actor_profile"}[code]
-                self._add(report, counters, code, _candidate(params[1], location, code, "[1]", Class.VERIFIED_TRANSLATABLE, role, "stock runtime stores value displayed by actor UI; not currently extracted"))
+                self._add(
+                    report,
+                    counters,
+                    code,
+                    _candidate(
+                        params[1],
+                        location,
+                        code,
+                        "[1]",
+                        Class.VERIFIED_TRANSLATABLE,
+                        role,
+                        "stock runtime stores value displayed by actor UI; current extractor",
+                    ),
+                    current=True,
+                )
             elif code in _INTERNAL_STRING_CODES:
                 counters[code][Class.INTERNAL.value] += len(strings)
             elif code == 122 and len(params) > 4 and params[3] == 4 and _text(params[4]):
@@ -713,7 +727,7 @@ _DB_RULES = (
     ("Actors.json", "[*].nickname", "player_visible", True),
     ("Actors.json", "[*].profile", "player_visible", True),
     ("Actors.json", "[*].note", "note_script", False),
-    ("Classes.json", "[*].name", "player_visible", False),
+    ("Classes.json", "[*].name", "player_visible", True),
     ("Classes.json", "[*].note", "note_script", False),
     ("Skills.json", "[*].name", "player_visible", True),
     ("Skills.json", "[*].description", "player_visible", True),
