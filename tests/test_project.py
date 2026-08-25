@@ -121,6 +121,17 @@ class ProjectManagerTests(unittest.TestCase):
         self.assertTrue(source)
         self.assertEqual("", translated[0]["translation"])
 
+    def test_project_create_reuses_packaged_www_content_root(self) -> None:
+        packaged = self.workspace / "packaged"
+        _game(packaged / "www", EngineId.RPGMAKER_MV)
+        (packaged / "Game.exe").write_bytes(b"synthetic")
+        output = self.workspace / "packaged-project"
+
+        result = self.manager.create(packaged, output)
+
+        self.assertEqual(EngineId.RPGMAKER_MV, result.config.engine)
+        self.assertGreater(result.translation_entries, 0)
+
     def test_project_can_move_to_another_path(self) -> None:
         moved = self.workspace / "other-pc" / "moved-project"
         moved.parent.mkdir()

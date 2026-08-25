@@ -6,6 +6,7 @@ from pathlib import Path
 
 from core.models import EngineId
 from engines.rpgmaker.detector import RpgMakerEngine
+from engines.rpgmaker.paths import resolve_rpgmaker_content_root
 
 
 def _touch(root: Path, relative_path: str) -> None:
@@ -51,6 +52,32 @@ class RpgMakerDetectorTests(unittest.TestCase):
         self.assertTrue(result.detected)
         self.assertEqual(EngineId.RPGMAKER_MV, result.engine)
         self.assertEqual(90, result.confidence)
+
+    def test_packaged_root_and_www_detect_the_same_mv_content(self) -> None:
+        packaged_root = self.root / "packaged"
+        www = packaged_root / "www"
+        _touch(www, "js/rpg_core.js")
+        _touch(www, "data/System.json")
+        _touch(www, "data/Map001.json")
+        _touch(www, "index.html")
+        _touch(packaged_root, "Game.exe")
+
+        from_root = self.detector.detect(packaged_root)
+        from_www = self.detector.detect(www)
+
+        self.assertEqual(www, resolve_rpgmaker_content_root(packaged_root))
+        self.assertEqual(www, resolve_rpgmaker_content_root(www))
+        self.assertEqual(from_www, from_root)
+        self.assertTrue(from_root.detected)
+        self.assertEqual(EngineId.RPGMAKER_MV, from_root.engine)
+        self.assertGreaterEqual(from_root.confidence, 95)
+
+        (packaged_root / "data").mkdir()
+        (packaged_root / "js").mkdir()
+        self.assertEqual(packaged_root, resolve_rpgmaker_content_root(packaged_root))
+
+    def test_content_root_resolver_preserves_unknown_directory(self) -> None:
+        self.assertEqual(self.root, resolve_rpgmaker_content_root(self.root))
 
     def test_does_not_confirm_from_a_single_core_file(self) -> None:
         _touch(self.root, "js/rmmz_core.js")

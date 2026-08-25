@@ -16,6 +16,7 @@ from engines.rpgmaker.fingerprint import (
     calculate_legacy_game_fingerprint_0_8_1,
 )
 from engines.rpgmaker.inserter import RpgMakerInserter
+from engines.rpgmaker.paths import resolve_rpgmaker_content_root
 from engines.rpgmaker.qa import QaResult, RpgMakerQa
 from engines.rpgmaker.validator import JapaneseAllowlist
 
@@ -47,8 +48,9 @@ class RpgMakerEngine(EnginePlugin):
     )
 
     def detect(self, game_directory: Path) -> DetectionResult:
+        content_root = resolve_rpgmaker_content_root(game_directory)
         candidates = [
-            self._evaluate_signature(game_directory, signature)
+            self._evaluate_signature(content_root, signature)
             for signature in _SIGNATURES
         ]
         best = max(candidates, key=lambda result: result.confidence)
@@ -78,10 +80,11 @@ class RpgMakerEngine(EnginePlugin):
         return result
 
     def extract_entries(self, game_directory: Path) -> ExtractionResult:
-        detection = self.detect(game_directory)
+        content_root = resolve_rpgmaker_content_root(game_directory)
+        detection = self.detect(content_root)
         if not detection.detected or detection.engine is None:
             raise ValueError("RPG Maker MV/MZ could not be detected")
-        return RpgMakerExtractor(detection.engine).extract(game_directory)
+        return RpgMakerExtractor(detection.engine).extract(content_root)
 
     def apply(
         self,
@@ -176,7 +179,10 @@ class RpgMakerEngine(EnginePlugin):
     ) -> GameFingerprint:
         if engine not in self.supported_engines:
             raise ValueError(f"unsupported RPG Maker engine: {engine}")
-        return calculate_game_fingerprint(game_directory, engine)
+        return calculate_game_fingerprint(
+            resolve_rpgmaker_content_root(game_directory),
+            engine,
+        )
 
     def accepts_legacy_fingerprint(
         self,
@@ -185,7 +191,7 @@ class RpgMakerEngine(EnginePlugin):
         expected: str,
     ) -> bool:
         legacy = calculate_legacy_game_fingerprint_0_8_1(
-            game_directory,
+            resolve_rpgmaker_content_root(game_directory),
             engine,
         )
         return legacy.value == expected
