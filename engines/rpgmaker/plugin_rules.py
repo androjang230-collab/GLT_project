@@ -134,6 +134,20 @@ def extract_runtime_payload(
             selected[0].start(),
             selected[-1].end(),
         )
+    if argument_mode == "joined_optional_numeric_tail":
+        selected = args[start_index:]
+        if len(selected) > 1:
+            tail = selected[-1].group(0)
+            if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", tail):
+                selected = selected[:-1]
+            elif "\\" in tail:
+                return None
+        return MvRuntimePayload(
+            command,
+            " ".join(item.group(0) for item in selected),
+            selected[0].start(),
+            selected[-1].end(),
+        )
     return None
 
 

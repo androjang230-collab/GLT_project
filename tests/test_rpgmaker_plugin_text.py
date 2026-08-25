@@ -265,6 +265,46 @@ Game_Interpreter.prototype.pluginCommand = function(command, args) {
         self.assertEqual("popup new translated words", raw)
         self.assertEqual(1, report.applied)
 
+    def test_transformed_join_with_optional_numeric_tail_applies_safely(self) -> None:
+        game = _write_game(
+            self.root,
+            EngineId.RPGMAKER_MV,
+            [_command(356, ["compose old words 36"])],
+        )
+        _write_mv_plugin(game, "ComposePlugin", """
+var normalizeAny = function(value) { return (value || '').toUpperCase(); };
+var rebuildAny = function(parts, startIndex, endIndex) {
+ if (arguments.length < 2) startIndex = 0;
+ if (arguments.length < 3) endIndex = parts.length;
+ var text = '';
+ for (var i = startIndex; i < endIndex; i++) {
+  text += parts[i];
+  if (i < endIndex - 1) text += ' ';
+ }
+ return text;
+};
+$display.queuePictureText = function(value) { this.pictureText = value; };
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ switch (normalizeAny(command)) {
+ case 'COMPOSE':
+  if (isNaN(args[args.length - 1]) || args.length === 1) args.push(28);
+  var size = Number(args.pop());
+  $display.queuePictureText(rebuildAny(args), size);
+  break;
+ }
+};
+""")
+        entry = RpgMakerExtractor(EngineId.RPGMAKER_MV).extract(game).entries[0]
+        self.assertEqual("old words", entry.original)
+        self.assertEqual(
+            "joined_optional_numeric_tail",
+            entry.extra_metadata["argument_mode"],
+        )
+        report, output, _ = self._apply(game, EngineId.RPGMAKER_MV, "new translated words")
+        raw = _document(output)["events"][1]["pages"][0]["list"][0]["parameters"][0]
+        self.assertEqual("compose new translated words 36", raw)
+        self.assertEqual(1, report.applied)
+
     def test_disabled_discovered_plugin_does_not_expand_extraction(self) -> None:
         game = _write_game(
             self.root,

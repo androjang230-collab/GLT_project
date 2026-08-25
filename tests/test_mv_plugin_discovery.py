@@ -177,6 +177,60 @@ Game_Interpreter.prototype.pluginCommand = function(command, args) {
         self.assertEqual([], report.observations)
         self.assertTrue(any(item.code == "PLUGIN_REGISTRY_ERROR" for item in report.issues))
 
+    def test_generic_command_transform_and_reconstruction_helpers(self) -> None:
+        report = self._write({"Transformed": """
+var normalizeRoute = function(value) { return (value || '').toUpperCase(); };
+var rebuildWords = function(parts) { return parts.join(' '); };
+$display.queueWindowText = function(value) { this.windowText = value; };
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ var localCommand = command;
+ var localArgs = args;
+ this.routeTransformed(localCommand, localArgs);
+};
+Game_Interpreter.prototype.routeTransformed = function(cmd, argv) {
+ switch (normalizeRoute(cmd)) {
+ case 'ANNOUNCE': $display.queueWindowText(rebuildWords(argv)); break;
+ }
+};
+"""})
+        item = report.observations[0]
+        self.assertEqual("ANNOUNCE", item.command)
+        self.assertEqual("upper", item.command_normalization)
+        self.assertEqual("joined_remainder", item.argument_mode)
+        self.assertEqual("safe", item.space_policy)
+        self.assertEqual(APPLY_VERIFIED, item.classification)
+
+    def test_command_dispatch_helper_depth_two_is_bounded(self) -> None:
+        report = self._write({"TwoHop": """
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ this.firstRoute(command, args);
+};
+Game_Interpreter.prototype.firstRoute = function(cmd, argv) {
+ this.secondRoute(cmd, argv);
+};
+Game_Interpreter.prototype.secondRoute = function(name, values) {
+ if (name.toLowerCase() === 'twostep') { $gameMessage.add(values[0]); }
+};
+"""})
+        item = report.observations[0]
+        self.assertEqual(("firstRoute", "secondRoute"), item.helper_chain)
+        self.assertEqual("lower", item.command_normalization)
+        self.assertEqual("single_token", item.argument_mode)
+
+    def test_display_configuration_and_dynamic_helper_are_not_verified(self) -> None:
+        report = self._write({"Conservative": """
+Game_Screen.prototype.setWindowTextAlign = function(value) {
+ this.windowTextAlign = value;
+};
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ if (command === 'ConfigOnly') { $gameScreen.setWindowTextAlign(args[0]); }
+ if (command === 'Dynamic') { this[args[0]](args); }
+};
+"""})
+        rows = {item.command: item for item in report.observations}
+        self.assertNotEqual(APPLY_VERIFIED, rows["ConfigOnly"].classification)
+        self.assertEqual(UNKNOWN, rows["Dynamic"].classification)
+
 
 if __name__ == "__main__":
     unittest.main()

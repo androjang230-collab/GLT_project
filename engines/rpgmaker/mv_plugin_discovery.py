@@ -324,63 +324,215 @@ def _balanced_end(text: str, start: int, opening: str, closing: str) -> int | No
 def _analyze_handler(plugin: _PluginRecord, handler: _Function, functions: list[_Function]) -> list[MvPluginDiscovery]:
     if len(handler.parameters) < 2:
         return []
-    command_var, args_var = handler.parameters[:2]
-    bodies = [(handler.body, "direct", ())]
-    for helper_name in _called_dispatch_helpers(handler.body, command_var, args_var):
-        full = f"Game_Interpreter.prototype.{helper_name}"
-        helper = next((item for item in functions if item.name == full and len(item.parameters) >= 2), None)
-        if helper is not None:
-            bodies.append((helper.body, "helper_dispatch", (helper_name,)))
     results: list[MvPluginDiscovery] = []
-    for body, kind, dispatch_chain in bodies:
-        command_name = command_var if kind == "direct" else next(
-            item.parameters[0] for item in functions if item.name == f"Game_Interpreter.prototype.{dispatch_chain[0]}"
-        )
-        argument_name = args_var if kind == "direct" else next(
-            item.parameters[1] for item in functions if item.name == f"Game_Interpreter.prototype.{dispatch_chain[0]}"
-        )
-        aliases = {command_name}
-        aliases.update(re.findall(rf"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*{re.escape(command_name)}\s*;", body))
-        for literal, branch, normalization in _command_branches(body, aliases):
+    for body, command_name, argument_name, kind, dispatch_chain in _dispatch_bodies(
+        handler, functions
+    ):
+        for literal, branch, normalization in _command_branches(
+            body, command_name, functions
+        ):
             results.append(
                 _classify_branch(plugin, literal, normalization, branch, argument_name, functions, kind, dispatch_chain)
             )
     return results
 
 
-def _called_dispatch_helpers(body: str, command_var: str, args_var: str) -> set[str]:
-    pattern = re.compile(
-        rf"this\.([A-Za-z_$][\w$]*)\s*\(\s*{re.escape(command_var)}\s*,\s*{re.escape(args_var)}\s*\)"
-    )
-    return set(pattern.findall(body))
+def _dispatch_bodies(
+    handler: _Function,
+    functions: list[_Function],
+    *,
+    max_depth: int = 2,
+) -> Iterator[tuple[str, str, str, str, tuple[str, ...]]]:
+    """Yield direct and statically named command/args helper bodies."""
 
-
-def _command_branches(body: str, aliases: set[str]) -> Iterator[tuple[str, str, str]]:
-    alias_pattern = "|".join(re.escape(item) for item in sorted(aliases, key=len, reverse=True))
-    expression = rf"(?:{alias_pattern})(?:\.to(?:Upper|Lower)Case\(\))?"
-    compare = re.compile(rf"(?P<expr>{expression})\s*={{2,3}}\s*(['\"])(?P<literal>.*?)\2")
-    for match in compare.finditer(body):
-        branch = _branch_after_comparison(body, match.end())
-        if branch is not None:
-            yield match.group("literal"), branch, _command_normalization(match.group("expr"))
-    switch = re.compile(rf"switch\s*\(\s*(?P<expr>{expression})\s*\)\s*\{{")
-    for match in switch.finditer(body):
-        end = _balanced_end(body, match.end() - 1, "{", "}")
-        if end is None:
+    queue = [(handler, (), 0)]
+    visited = {handler.name}
+    while queue:
+        current, chain, depth = queue.pop(0)
+        command_var, args_var = current.parameters[:2]
+        yield (
+            current.body,
+            command_var,
+            args_var,
+            "direct" if not chain else "helper_dispatch",
+            chain,
+        )
+        if depth >= max_depth:
             continue
-        switch_body = body[match.end():end - 1]
-        cases = list(re.finditer(r"case\s*(['\"])(.*?)\1\s*:", switch_body))
-        for index, case in enumerate(cases):
-            stop = cases[index + 1].start() if index + 1 < len(cases) else len(switch_body)
-            yield case.group(2), switch_body[case.end():stop], _command_normalization(match.group("expr"))
+        command_aliases = _direct_alias_names(current.body, command_var)
+        args_aliases = _direct_alias_names(current.body, args_var)
+        for call in _iter_named_calls(current.body):
+            if len(call[1]) < 2:
+                continue
+            if call[1][0].strip() not in command_aliases or call[1][1].strip() not in args_aliases:
+                continue
+            helper = _resolve_function(call[0], functions)
+            if helper is None or len(helper.parameters) < 2 or helper.name in visited:
+                continue
+            visited.add(helper.name)
+            queue.append((helper, chain + (_short_function_name(helper.name),), depth + 1))
 
 
-def _command_normalization(expression: str) -> str:
-    if ".toUpperCase()" in expression:
+def _direct_alias_names(body: str, source: str) -> set[str]:
+    aliases = {source}
+    changed = True
+    while changed:
+        changed = False
+        for name, value in re.findall(
+            r"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*;",
+            body,
+        ):
+            if value in aliases and name not in aliases:
+                aliases.add(name)
+                changed = True
+    return aliases
+
+
+def _command_branches(
+    body: str,
+    command_var: str,
+    functions: list[_Function],
+) -> Iterator[tuple[str, str, str]]:
+    expressions = _command_expressions(body, command_var, functions)
+    seen: set[tuple[int, str]] = set()
+    for expression, normalization in sorted(
+        expressions.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        escaped = re.escape(expression)
+        compare = re.compile(
+            rf"(?P<expr>{escaped})\s*={{2,3}}\s*(['\"])(?P<literal>.*?)\2"
+        )
+        for match in compare.finditer(body):
+            marker = (match.start(), match.group("literal"))
+            if marker in seen:
+                continue
+            branch = _branch_after_comparison(body, match.end())
+            if branch is not None:
+                seen.add(marker)
+                yield match.group("literal"), branch, normalization
+        switch = re.compile(rf"switch\s*\(\s*{escaped}\s*\)\s*\{{")
+        for match in switch.finditer(body):
+            end = _balanced_end(body, match.end() - 1, "{", "}")
+            if end is None:
+                continue
+            switch_body = body[match.end():end - 1]
+            cases = _top_level_cases(switch_body)
+            for index, (literal, case_start, content_start) in enumerate(cases):
+                marker = (match.start() + case_start, literal)
+                if marker in seen:
+                    continue
+                stop = cases[index + 1][1] if index + 1 < len(cases) else len(switch_body)
+                seen.add(marker)
+                yield literal, switch_body[content_start:stop], normalization
+
+
+def _top_level_cases(body: str) -> list[tuple[str, int, int]]:
+    cases: list[tuple[str, int, int]] = []
+    index = 0
+    depth = 0
+    quote: str | None = None
+    pattern = re.compile(r"case\s*(['\"])(.*?)\1\s*:")
+    while index < len(body):
+        char = body[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in {"'", '"', "`"}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            match = pattern.match(body, index)
+            if match is not None:
+                cases.append((match.group(2), match.start(), match.end()))
+                index = match.end()
+                continue
+        index += 1
+    return cases
+
+
+def _command_expressions(
+    body: str,
+    command_var: str,
+    functions: list[_Function],
+) -> dict[str, str]:
+    expressions = {
+        command_var: "exact",
+        f"{command_var}.toUpperCase()": "upper",
+        f"{command_var}.toLowerCase()": "lower",
+    }
+    for name, value in re.findall(
+        r"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;]+);",
+        body,
+    ):
+        normalization = _resolve_command_transform(value.strip(), command_var, functions)
+        if normalization is not None:
+            expressions[name] = normalization
+    for helper in functions:
+        if len(helper.parameters) != 1 or "." in helper.name:
+            continue
+        normalization = _function_command_transform(helper, functions, set(), 0)
+        if normalization is not None:
+            expressions[f"{helper.name}({command_var})"] = normalization
+    return expressions
+
+
+def _resolve_command_transform(
+    expression: str,
+    source_var: str,
+    functions: list[_Function],
+) -> str | None:
+    compact = re.sub(r"\s+", "", expression)
+    source = re.escape(source_var)
+    if re.fullmatch(source, compact):
+        return "exact"
+    if re.fullmatch(rf"{source}\.toUpperCase\(\)", compact):
         return "upper"
-    if ".toLowerCase()" in expression:
+    if re.fullmatch(rf"{source}\.toLowerCase\(\)", compact):
         return "lower"
-    return "exact"
+    match = re.fullmatch(r"([A-Za-z_$][\w$]*)\((.*)\)", compact)
+    if match and match.group(2) == source_var:
+        helper = _resolve_function(match.group(1), functions)
+        if helper is not None and len(helper.parameters) == 1:
+            return _function_command_transform(helper, functions, set(), 0)
+    return None
+
+
+def _function_command_transform(
+    helper: _Function,
+    functions: list[_Function],
+    visited: set[str],
+    depth: int,
+) -> str | None:
+    if depth > 2 or helper.name in visited or len(helper.parameters) != 1:
+        return None
+    returns = re.findall(r"\breturn\s+([^;]+);", helper.body)
+    if len(returns) != 1:
+        return None
+    expression = returns[0]
+    parameter = helper.parameters[0]
+    compact = re.sub(r"\s+", "", expression)
+    if parameter not in compact:
+        return None
+    if compact.endswith(".toUpperCase()"):
+        return "upper"
+    if compact.endswith(".toLowerCase()"):
+        return "lower"
+    if compact in {parameter, f"({parameter})"}:
+        return "exact"
+    nested = re.fullmatch(r"([A-Za-z_$][\w$]*)\((.*)\)", compact)
+    if nested and nested.group(2) == parameter:
+        target = _resolve_function(nested.group(1), functions)
+        if target is not None:
+            return _function_command_transform(
+                target, functions, visited | {helper.name}, depth + 1
+            )
+    return None
 
 
 def _branch_after_comparison(body: str, position: int) -> str | None:
@@ -400,11 +552,14 @@ _DISPLAY_SINKS = (
     (re.compile(r"(?:\.|\b)drawText\s*\("), 0, "drawText"),
     (re.compile(r"CommonPopupManager\.showInfo\s*\("), 1, "CommonPopupManager.showInfo"),
 )
+_DISPLAY_STATE_TERMS = ("picture", "window", "popup", "notice", "message", "info")
+_DISPLAY_CONFIG_TERMS = ("align", "color", "font", "position", "setting", "config", "size")
 _INTERNAL_HINT = re.compile(
     r"(?:movement|movePlayer|moveEvent|unlockClass|removeClass|\$gameSwitches|"
     r"\$gameVariables|\$gameScreen|showPicture|AudioManager|shop|save|actorId|"
     r"classId|itemId|skillId|mapId|eventId|setValue|ImageManager|AudioManager)", re.I
 )
+_ARRAY_MUTATION = re.compile(r"\.\s*(?:pop|push|shift|unshift|splice)\s*\(")
 
 
 def _classify_branch(
@@ -418,16 +573,29 @@ def _classify_branch(
     dispatch_chain: tuple[str, ...],
 ) -> MvPluginDiscovery:
     aliases = _local_aliases(branch)
-    display = _find_display_flow(branch, args_var, aliases)
+    display = _find_display_flow(branch, args_var, aliases, functions)
     helper_chain = list(dispatch_chain)
     if display is None:
-        display, helper = _find_one_helper_flow(branch, args_var, aliases, functions)
-        if helper:
-            helper_chain.append(helper)
+        display, helpers = _find_helper_flow(
+            branch,
+            args_var,
+            aliases,
+            functions,
+            0,
+            max(0, 2 - len(dispatch_chain)),
+            set(),
+        )
+        helper_chain.extend(helpers)
     if display is not None:
         flow, sink = display
-        apply_safe = flow.mode in {"single_token", "fixed_index", "joined_remainder", "joined_slice"}
-        space_policy = "safe" if flow.mode in {"joined_remainder", "joined_slice"} else "requires_protection"
+        if _ARRAY_MUTATION.search(branch):
+            transformed = _optional_numeric_tail_flow(branch, args_var, flow)
+            flow = transformed or _Flow("unknown", (), None)
+        apply_safe = flow.mode in {
+            "single_token", "fixed_index", "joined_remainder", "joined_slice",
+            "joined_optional_numeric_tail",
+        }
+        space_policy = "safe" if flow.mode.startswith("joined_") else "requires_protection"
         classification = APPLY_VERIFIED if apply_safe else DISCOVERED_VERIFIED
         return _observation(plugin, command, command_normalization, handler_kind, flow, tuple(helper_chain), sink, "display", classification, "high", space_policy)
     flows = list(_all_flows(branch, args_var, aliases))
@@ -476,7 +644,12 @@ def _local_aliases(body: str) -> dict[str, str]:
     }
 
 
-def _find_display_flow(body: str, args_var: str, aliases: dict[str, str]) -> tuple[_Flow, str] | None:
+def _find_display_flow(
+    body: str,
+    args_var: str,
+    aliases: dict[str, str],
+    functions: list[_Function],
+) -> tuple[_Flow, str] | None:
     for pattern, argument_index, sink in _DISPLAY_SINKS:
         for match in pattern.finditer(body):
             end = _balanced_end(body, match.end() - 1, "(", ")")
@@ -485,36 +658,98 @@ def _find_display_flow(body: str, args_var: str, aliases: dict[str, str]) -> tup
             arguments = _split_arguments(body[match.end():end - 1])
             if argument_index >= len(arguments):
                 continue
-            flow = _parse_flow(arguments[argument_index], args_var, aliases)
+            flow = _parse_flow(arguments[argument_index], args_var, aliases, functions)
             if flow is not None:
                 return flow, sink
+    for callee, arguments in _iter_named_calls(body):
+        if not arguments or not _is_display_state_sink(callee, functions):
+            continue
+        flow = _parse_flow(arguments[0], args_var, aliases, functions)
+        if flow is not None:
+            return flow, callee
     return None
 
 
-def _find_one_helper_flow(
-    body: str, args_var: str, aliases: dict[str, str], functions: list[_Function]
-) -> tuple[tuple[_Flow, str] | None, str | None]:
-    calls = re.finditer(r"(?<!function\s)(?P<name>[A-Za-z_$][\w$]*)\s*\(", body)
-    for call in calls:
-        name = call.group("name")
-        if name in {"if", "switch", "Number", "parseInt", "eval"}:
+def _find_helper_flow(
+    body: str,
+    args_var: str,
+    aliases: dict[str, str],
+    functions: list[_Function],
+    depth: int,
+    max_depth: int,
+    visited: set[str],
+) -> tuple[tuple[_Flow, str] | None, tuple[str, ...]]:
+    if depth >= max_depth:
+        return None, ()
+    for name, actual in _iter_named_calls(body):
+        if _short_function_name(name) in {"if", "switch", "Number", "parseInt", "eval"}:
             continue
-        end = _balanced_end(body, call.end() - 1, "(", ")")
-        if end is None:
-            continue
-        actual = _split_arguments(body[call.end():end - 1])
-        helper = next((item for item in functions if item.name == name and item.parameters), None)
-        if helper is None:
+        helper = _resolve_function(name, functions)
+        if helper is None or not helper.parameters or helper.name in visited:
             continue
         for index, expression in enumerate(actual):
-            flow = _parse_flow(expression, args_var, aliases)
+            flow = _parse_flow(expression, args_var, aliases, functions)
             if flow is None or index >= len(helper.parameters):
                 continue
             parameter = helper.parameters[index]
-            helper_display = _find_display_flow(helper.body, parameter, _local_aliases(helper.body))
+            helper_aliases = _local_aliases(helper.body)
+            helper_display = _find_display_flow(
+                helper.body, parameter, helper_aliases, functions
+            )
             if helper_display is not None:
-                return (flow, helper_display[1]), name
-    return None, None
+                return (flow, helper_display[1]), (_short_function_name(helper.name),)
+            nested, chain = _find_helper_flow(
+                helper.body,
+                parameter,
+                helper_aliases,
+                functions,
+                depth + 1,
+                max_depth,
+                visited | {helper.name},
+            )
+            if nested is not None:
+                return (flow, nested[1]), (_short_function_name(helper.name),) + chain
+    return None, ()
+
+
+def _is_display_state_sink(callee: str, functions: list[_Function]) -> bool:
+    method = _short_function_name(callee)
+    folded = method.casefold()
+    if (
+        "text" not in folded
+        or not any(term in folded for term in _DISPLAY_STATE_TERMS)
+        or any(term in folded for term in _DISPLAY_CONFIG_TERMS)
+    ):
+        return False
+    helper = _resolve_function(callee, functions)
+    if helper is None or not helper.parameters:
+        return False
+    parameter = re.escape(helper.parameters[0])
+    return bool(
+        re.search(
+            rf"this\.[A-Za-z_$][\w$]*(?:text|message|notice|info)[A-Za-z0-9_$]*\s*(?:=|\+=)[^;]*\b{parameter}\b",
+            helper.body,
+            re.I,
+        )
+    )
+
+
+def _optional_numeric_tail_flow(
+    branch: str,
+    args_var: str,
+    flow: _Flow,
+) -> _Flow | None:
+    escaped = re.escape(args_var)
+    if flow.mode != "joined_remainder":
+        return None
+    required = (
+        re.search(rf"\b{escaped}\.pop\s*\(\s*\)", branch),
+        re.search(rf"\b{escaped}\.push\s*\(", branch),
+        re.search(rf"\b{escaped}\s*\[\s*{escaped}\.length\s*-\s*1\s*\]", branch),
+        re.search(r"\bisNaN\s*\(", branch),
+        re.search(rf"\b{escaped}\.length\s*={{2,3}}\s*1\b", branch),
+    )
+    return _Flow("joined_optional_numeric_tail", (), 0) if all(required) else None
 
 
 def _all_flows(body: str, args_var: str, aliases: dict[str, str]) -> Iterator[_Flow]:
@@ -527,10 +762,16 @@ def _all_flows(body: str, args_var: str, aliases: dict[str, str]) -> Iterator[_F
                 seen.add(flow); yield flow
 
 
-def _parse_flow(expression: str, args_var: str, aliases: dict[str, str], depth: int = 0) -> _Flow | None:
+def _parse_flow(
+    expression: str,
+    args_var: str,
+    aliases: dict[str, str],
+    functions: list[_Function] | None = None,
+    depth: int = 0,
+) -> _Flow | None:
     text = expression.strip()
     if depth < 3 and re.fullmatch(r"[A-Za-z_$][\w$]*", text) and text in aliases:
-        return _parse_flow(aliases[text], args_var, aliases, depth + 1)
+        return _parse_flow(aliases[text], args_var, aliases, functions, depth + 1)
     escaped = re.escape(args_var)
     numeric = re.search(rf"(?:Number|parseInt)\s*\(\s*{escaped}\[(\d+)\]", text)
     if numeric:
@@ -546,9 +787,86 @@ def _parse_flow(expression: str, args_var: str, aliases: dict[str, str], depth: 
         return _Flow("single_token" if indices[0] == 0 else "fixed_index", indices, indices[0])
     if len(indices) > 1:
         return _Flow("multiple_fixed", indices, min(indices))
+    if functions is not None and depth < 3:
+        reconstructed = _helper_reconstruction_flow(
+            text, args_var, aliases, functions, depth
+        )
+        if reconstructed is not None:
+            return reconstructed
     if re.search(rf"\b{escaped}\b", text):
         return _Flow("unknown", (), None)
     return None
+
+
+def _helper_reconstruction_flow(
+    expression: str,
+    args_var: str,
+    aliases: dict[str, str],
+    functions: list[_Function],
+    depth: int,
+) -> _Flow | None:
+    for callee, actual in _iter_named_calls(expression):
+        helper = _resolve_function(callee, functions)
+        if helper is None or not helper.parameters or not actual:
+            continue
+        source = _parse_flow(actual[0], args_var, aliases, None, depth + 1)
+        if source is None or source.mode != "unknown":
+            continue
+        mode = _reconstruction_helper_mode(helper)
+        if mode is None:
+            continue
+        helper_mode, default_start = mode
+        if len(actual) >= 3:
+            continue
+        start = default_start
+        if len(actual) == 2:
+            if not re.fullmatch(r"\d+", actual[1].strip()):
+                continue
+            start = int(actual[1].strip())
+        if start is None:
+            continue
+        if start == 0:
+            return _Flow("joined_remainder", (), 0)
+        return _Flow("joined_slice", (), start)
+    return None
+
+
+def _reconstruction_helper_mode(helper: _Function) -> tuple[str, int | None] | None:
+    array = re.escape(helper.parameters[0])
+    direct_join = re.search(
+        rf"\breturn\s+{array}\.join\(\s*['\"] ['\"]\s*\)\s*;",
+        helper.body,
+    )
+    if direct_join:
+        return "joined_remainder", 0
+    direct_slice = re.search(
+        rf"\breturn\s+{array}\.slice\(\s*(\d+)\s*\)\.join\(\s*['\"] ['\"]\s*\)\s*;",
+        helper.body,
+    )
+    if direct_slice:
+        return "joined_slice", int(direct_slice.group(1))
+    if len(helper.parameters) < 2:
+        return None
+    start_name = helper.parameters[1]
+    index_match = re.search(
+        rf"for\s*\(\s*var\s+([A-Za-z_$][\w$]*)\s*=\s*{re.escape(start_name)}\s*;",
+        helper.body,
+    )
+    if index_match is None:
+        return None
+    index = re.escape(index_match.group(1))
+    structural = (
+        re.search(rf"\b{array}\s*\[\s*{index}\s*\]", helper.body),
+        re.search(r"\+=\s*['\"] ['\"]\s*;", helper.body),
+        re.search(r"\breturn\s+[A-Za-z_$][\w$]*\s*;", helper.body),
+    )
+    if not all(structural):
+        return None
+    default = re.search(
+        rf"arguments\.length\s*<\s*2\s*\)\s*{re.escape(start_name)}\s*=\s*(\d+)",
+        helper.body,
+    )
+    return "joined_slice", int(default.group(1)) if default else None
 
 
 def _split_arguments(value: str) -> list[str]:
@@ -564,6 +882,34 @@ def _split_arguments(value: str) -> list[str]:
             result.append(value[start:index].strip()); start = index + 1
     result.append(value[start:].strip())
     return result
+
+
+def _iter_named_calls(value: str) -> Iterator[tuple[str, list[str]]]:
+    pattern = re.compile(
+        r"(?<!function\s)(?P<name>(?:this\.|\$?[A-Za-z_$][\w$]*\.)*"
+        r"[A-Za-z_$][\w$]*)\s*\("
+    )
+    for match in pattern.finditer(value):
+        end = _balanced_end(value, match.end() - 1, "(", ")")
+        if end is None:
+            continue
+        yield match.group("name"), _split_arguments(value[match.end():end - 1])
+
+
+def _short_function_name(name: str) -> str:
+    return name.rsplit(".", 1)[-1]
+
+
+def _resolve_function(name: str, functions: list[_Function]) -> _Function | None:
+    if name.startswith("this."):
+        exact = f"Game_Interpreter.prototype.{name[5:]}"
+        candidates = [item for item in functions if item.name == exact]
+    else:
+        candidates = [item for item in functions if item.name == name]
+        if not candidates and "." in name:
+            short = _short_function_name(name)
+            candidates = [item for item in functions if item.name.endswith(f".{short}")]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _internal_sink(branch: str) -> str:

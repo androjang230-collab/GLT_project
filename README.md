@@ -1,7 +1,7 @@
 # Game Localization Toolkit (GLT)
 
 Windows 11에서 일본 동인게임의 번역 가능한 문자열을 안전하게 다루기 위한
-개인용 Python 도구입니다. 현재 버전은 **GLT 0.8.4**이며 RPG Maker MV/MZ의
+개인용 Python 도구입니다. 현재 버전은 **GLT 0.8.5**이며 RPG Maker MV/MZ의
 엔진 감지, UTF-8 JSONL 추출, 별도 폴더 안전 적용, 독립 QA, dry-run,
 fingerprint와 이식 가능한 번역 Project, 사용자 Glossary 및 JSONL Translation
 Memory, 폰트 진단과 안전한 기본 폰트 패치를 구현합니다. 대용량 번역 JSONL은
@@ -1008,3 +1008,14 @@ reconstruction까지 확정된 `APPLY_VERIFIED`만 기존 JSONL extraction/apply
 연결합니다. single-token 번역에 일반 공백이 생기면
 `PLUGIN_ARGUMENT_SPACE_UNSAFE`로 차단하며 NBSP 자동 변환은 하지 않습니다.
 기존 `ShowInfo`/`インフォ表示` 위치 ID와 schema version 1은 유지됩니다.
+
+## 0.8.5 MV helper / transform resolution
+
+0.8.4 discovery에 결정적인 command transform helper, args join helper, local
+command/args alias와 최대 2단계의 정적 helper dispatch를 추가했습니다. 표시 text
+state로 직접 전달되는 흐름과 rendering configuration을 구분하며 computed method,
+callback, recursion, eval은 계속 UNKNOWN/UNSAFE로 유지합니다.
+
+`joined_optional_numeric_tail`은 공백으로 재구성한 text 뒤의 명시적 숫자 option을
+원문에 보존합니다. runtime 제어코드 때문에 숫자 여부가 불명확하면 추출하지
+않습니다. 기존 ID, schema version 1과 `mv_info_display` 규칙은 변경하지 않습니다.
