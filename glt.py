@@ -21,6 +21,11 @@ from core.reports import write_dry_run_report
 from core.structure import StructureReport, write_structure_report
 from core.version import TOOL_VERSION
 from engines.registry import create_engine_registry
+from engines.rpgmaker.audit import (
+    RpgMakerCoverageAuditor,
+    write_candidate_csv,
+    write_coverage_report,
+)
 from engines.wolf.archive import find_wolf_game_root
 from engines.wolf.text_models import WolfTextReport, write_wolf_text_report
 from engines.wolf.text_extractor import (
@@ -145,6 +150,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="REPORT",
         help="create a portable machine-readable JSON report",
+    )
+
+    rpgmaker_audit_parser = subparsers.add_parser(
+        "rpgmaker-audit",
+        help="run a bounded read-only RPG Maker translation coverage audit",
+    )
+    rpgmaker_audit_parser.add_argument("game_directory", type=Path)
+    rpgmaker_audit_parser.add_argument(
+        "--report",
+        type=Path,
+        help="new privacy-preserving JSON report outside the game directory",
+    )
+    rpgmaker_audit_parser.add_argument(
+        "--csv",
+        type=Path,
+        help="new hash-only candidate CSV outside the game directory",
     )
 
     archive_parser = subparsers.add_parser(
@@ -609,6 +630,89 @@ def _handle_archive(args: argparse.Namespace, logger: logging.Logger) -> int:
         print()
         print(f"Report: {report_file}")
     return 0
+
+
+def _handle_rpgmaker_audit(
+    args: argparse.Namespace,
+    logger: logging.Logger,
+) -> int:
+    try:
+        game_directory = resolve_input_directory(args.game_directory)
+        selection = create_engine_registry().identify(game_directory)
+        detection = selection.detection
+        if detection.engine not in {EngineId.RPGMAKER_MV, EngineId.RPGMAKER_MZ}:
+            raise ValueError("RPG Maker MV/MZ could not be detected")
+
+        report_file = (
+            resolve_output_file(args.report) if args.report is not None else None
+        )
+        csv_file = resolve_output_file(args.csv) if args.csv is not None else None
+        for path, suffix, label in (
+            (report_file, ".json", "audit report"),
+            (csv_file, ".csv", "candidate CSV"),
+        ):
+            if path is None:
+                continue
+            if path.suffix.casefold() != suffix:
+                raise ValueError(f"{label} must use the {suffix} extension")
+            if path.exists():
+                raise FileExistsError(f"{label} already exists: {path}")
+            if path == game_directory or path.is_relative_to(game_directory):
+                raise ValueError(f"{label} cannot be written inside the game directory")
+        if report_file is not None and report_file == csv_file:
+            raise ValueError("audit report and candidate CSV paths must be different")
+
+        report = RpgMakerCoverageAuditor(detection.engine).audit(game_directory)
+        if report_file is not None:
+            write_coverage_report(report_file, report)
+        if csv_file is not None:
+            write_candidate_csv(csv_file, report)
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        logger.error("%s", exc)
+        return 2
+
+    stats = report.statistics
+    coverage = stats["coverage"]
+    print(f"RPG Maker Translation Coverage Audit ({report.engine})")
+    print(f"Event commands: {stats['total_event_commands']}")
+    print(f"Unique codes observed: {stats['unique_command_codes_observed']}")
+    print(f"Standard codes catalogued: {stats['standard_command_codes_catalogued']}")
+    print(f"String-bearing command occurrences: {stats['string_bearing_command_occurrences']}")
+    print()
+    print("Current GLT event coverage:")
+    print(f"- Known verified player-visible entries: {coverage['known_verified_player_visible_entries']}")
+    print(f"- Currently extracted: {coverage['currently_extracted']}")
+    print(f"- Known missed verified candidates: {coverage['known_missed_verified_candidates']}")
+    print(f"- Coverage: {coverage['percentage']:.2f}%")
+    print(f"- Denominator: {coverage['denominator_definition']}")
+    print()
+    print("Classification:")
+    for name, count in stats["classification_counts"].items():
+        print(f"- {name}: {count}")
+    print(f"Plugin candidates: {stats['plugin_candidates']}")
+    print(f"Script candidates: {stats['script_candidates']}")
+    database = stats["database_coverage"]
+    print(
+        "Database coverage: "
+        f"{database['currently_extracted']}/"
+        f"{database['known_verified_player_visible_entries']} "
+        f"({database['percentage']:.2f}%, "
+        f"missed {database['known_missed_verified_candidates']})"
+    )
+    print(
+        "Plugins inventoried: "
+        f"{len(report.plugins)} "
+        f"({sum(item.enabled for item in report.plugins)} enabled)"
+    )
+    print(f"Choice/plugin mirror mismatches: {stats['mirror_mismatches']}")
+    print(f"Issues: {stats['errors']} error(s), {stats['warnings']} warning(s)")
+    print(f"Source unchanged: {'yes' if report.source_unchanged else 'no'}")
+    print("Raw game text persisted: no")
+    if report_file is not None:
+        print(f"Report: {report_file}")
+    if csv_file is not None:
+        print(f"Candidate CSV: {csv_file}")
+    return 3 if stats["errors"] else 0
 
 
 def _handle_wolf_text(args: argparse.Namespace, logger: logging.Logger) -> int:
@@ -1203,6 +1307,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "wolf-native-probe":
         return _handle_wolf_native_probe(args, logger)
+
+    if args.command == "rpgmaker-audit":
+        return _handle_rpgmaker_audit(args, logger)
 
     if args.command in {"font-check", "font-patch"}:
         return _handle_font(args, logger)
