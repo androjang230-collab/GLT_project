@@ -8,7 +8,6 @@ same file as evidence for a command branch.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 from collections import Counter
@@ -16,10 +15,14 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator
 
+from engines.rpgmaker.plugin_inventory import (
+    PluginInventory as ActivePluginInventory,
+    load_plugin_inventory,
+)
+
 
 MAX_PLUGIN_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_PLUGIN_BYTES = 512 * 1024 * 1024
-MAX_PLUGIN_FILES = 2_000
 MAX_HANDLERS = 10_000
 
 APPLY_VERIFIED = "APPLY_VERIFIED"
@@ -144,6 +147,8 @@ class _Flow:
 def discover_mv_plugin_commands(
     plugin_config_file: Path | None,
     plugin_source_directory: Path,
+    *,
+    inventory: ActivePluginInventory | None = None,
 ) -> MvPluginDiscoveryReport:
     """Analyze enabled MV plugin sources without executing or modifying them."""
 
@@ -153,9 +158,29 @@ def discover_mv_plugin_commands(
     config = plugin_config_file.resolve() if plugin_config_file is not None else None
     if plugin_config_file is not None and _is_linklike(plugin_config_file):
         raise ValueError("plugins.js cannot be a symlink or junction")
-    registry, registry_issues = _load_registry(config, source_directory)
+    inventory = inventory or load_plugin_inventory(config, source_directory)
+    registry = [
+        _PluginRecord(
+            item.name,
+            item.enabled,
+            item.load_order,
+            item.source_path or source_directory / "__invalid__.js",
+        )
+        for item in inventory.plugins
+    ]
     report = MvPluginDiscoveryReport(registry_available=config is not None and config.is_file())
-    report.issues.extend(registry_issues)
+    enabled_by_name = {item.name: item.enabled for item in inventory.plugins}
+    report.issues.extend(
+        DiscoveryIssue(
+            item.severity,
+            item.code,
+            item.plugin_name,
+            Path(item.source_file).name if item.source_file else None,
+            item.reason,
+        )
+        for item in inventory.issues
+        if item.plugin_name is None or enabled_by_name.get(item.plugin_name) is not False
+    )
     report.plugin_count = len(registry)
     report.enabled_plugin_count = sum(item.enabled is True for item in registry)
 
@@ -178,20 +203,8 @@ def discover_mv_plugin_commands(
             or _is_linklike(plugin.source)
             or not plugin.source.resolve().is_relative_to(source_directory)
         ):
-            report.issues.append(
-                DiscoveryIssue(
-                    "warning", "PLUGIN_SOURCE_MISSING", plugin.name, None,
-                    "enabled plugin has no exact same-name source file",
-                )
-            )
             continue
         if plugin.source.stat().st_size > MAX_PLUGIN_BYTES:
-            report.issues.append(
-                DiscoveryIssue(
-                    "warning", "PLUGIN_SOURCE_TOO_LARGE", plugin.name,
-                    plugin.source.name, f"source exceeds {MAX_PLUGIN_BYTES} bytes",
-                )
-            )
             continue
         try:
             source = plugin.source.read_text(encoding="utf-8-sig")
@@ -223,37 +236,26 @@ def _load_registry(
     config: Path | None,
     source_directory: Path,
 ) -> tuple[list[_PluginRecord], list[DiscoveryIssue]]:
-    issues: list[DiscoveryIssue] = []
-    if config is None or not config.is_file():
-        files = sorted(source_directory.glob("*.js"), key=lambda item: item.name.casefold())
-        if len(files) > MAX_PLUGIN_FILES:
-            raise ValueError(f"plugin source count exceeds {MAX_PLUGIN_FILES}")
-        issues.append(
-            DiscoveryIssue("warning", "PLUGIN_REGISTRY_MISSING", None, None, "enabled status and load order are unavailable")
+    inventory = load_plugin_inventory(config, source_directory)
+    records = [
+        _PluginRecord(
+            item.name,
+            item.enabled,
+            item.load_order,
+            item.source_path or source_directory / "__invalid__.js",
         )
-        return [
-            _PluginRecord(path.stem, None, None, path)
-            for path in files
-        ], issues
-    try:
-        text = config.read_text(encoding="utf-8-sig")
-        match = re.search(r"(?:var\s+)?\$plugins\s*=\s*(\[[\s\S]*\])\s*;?\s*$", text)
-        if match is None:
-            raise ValueError("plugins.js does not contain a supported $plugins array")
-        payload = json.loads(match.group(1))
-    except (OSError, UnicodeError, ValueError) as exc:
-        issues.append(DiscoveryIssue("error", "PLUGIN_REGISTRY_ERROR", None, config.name, str(exc)))
-        return [], issues
-    if not isinstance(payload, list):
-        return [], [DiscoveryIssue("error", "PLUGIN_REGISTRY_ERROR", None, config.name, "plugin registry is not an array")]
-    records: list[_PluginRecord] = []
-    for index, item in enumerate(payload[:MAX_PLUGIN_FILES]):
-        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-            continue
-        name = item["name"]
-        safe = Path(name).name == name and name not in {".", ".."}
-        source = source_directory / f"{name}.js" if safe else source_directory / "__invalid__.js"
-        records.append(_PluginRecord(name, bool(item.get("status")), index, source))
+        for item in inventory.plugins
+    ]
+    issues = [
+        DiscoveryIssue(
+            item.severity,
+            item.code,
+            item.plugin_name,
+            Path(item.source_file).name if item.source_file else None,
+            item.reason,
+        )
+        for item in inventory.issues
+    ]
     return records, issues
 
 

@@ -48,6 +48,11 @@ from engines.rpgmaker.mv_plugin_discovery import (
     MvPluginDiscovery,
     discover_mv_plugin_commands,
 )
+from engines.rpgmaker.plugin_inventory import (
+    PluginInventory as ActivePluginInventory,
+    load_plugin_inventory,
+)
+from engines.rpgmaker.plugin_visibility import analyze_plugin_visibility
 from engines.rpgmaker.validator import detect_japanese_scripts
 
 
@@ -277,26 +282,67 @@ class RpgMakerCoverageAuditor:
             ) or (game_directory / "js/plugins.js").is_file(),
             source_before=before,
         )
+        config = self._plugin_config_file
+        sources = self._plugin_source_directory
+        if config is None:
+            default = game_directory / "js/plugins.js"
+            config = default if default.is_file() else None
+        if sources is None:
+            sources = game_directory / "js/plugins"
+        active_inventory: ActivePluginInventory | None = None
+        discovery = None
+        if (config is not None and config.is_file()) or sources.is_dir():
+            try:
+                active_inventory = load_plugin_inventory(config, sources)
+            except (OSError, UnicodeError, ValueError) as exc:
+                report.issues.append(
+                    AuditIssue("error", "PLUGIN_INVENTORY_ERROR", "js/plugins.js", str(exc))
+                )
+        if active_inventory is not None:
+            report.issues.extend(
+                AuditIssue(
+                    item.severity,
+                    item.code,
+                    item.source_file or "js/plugins.js",
+                    item.reason,
+                )
+                for item in active_inventory.issues
+                if not (
+                    item.code == "PLUGIN_REGISTRY_MISSING"
+                    and self.engine == EngineId.RPGMAKER_MZ
+                    and active_inventory.plugin_count == 0
+                )
+            )
         if self.engine == EngineId.RPGMAKER_MV:
-            config = self._plugin_config_file
-            sources = self._plugin_source_directory
-            if config is None:
-                default = game_directory / "js/plugins.js"
-                config = default if default.is_file() else None
-            if sources is None:
-                sources = game_directory / "js/plugins"
-            if sources.is_dir():
-                discovery = discover_mv_plugin_commands(config, sources)
+            if active_inventory is not None:
+                discovery = discover_mv_plugin_commands(
+                    config, sources, inventory=active_inventory
+                )
                 report.plugin_discovery = discovery.to_json_dict()
-                report.issues.extend(
-                    AuditIssue(
-                        item.severity,
+                existing = {
+                    (
                         item.code,
-                        item.plugin_file or "",
+                        Path(item.file).name if item.file else "",
                         item.reason,
                     )
-                    for item in discovery.issues
-                )
+                    for item in report.issues
+                }
+                for item in discovery.issues:
+                    key = (
+                        item.code,
+                        Path(item.plugin_file).name if item.plugin_file else "",
+                        item.reason,
+                    )
+                    if key not in existing:
+                        report.issues.append(
+                            AuditIssue(
+                                item.severity,
+                                item.code,
+                                item.plugin_file or "",
+                                item.reason,
+                            )
+                        )
+                        existing.add(key)
                 if self._sample_name is not None:
                     report.plugin_discovery["sample"] = self._sample_name
                 unique: dict[str, list[MvPluginDiscovery]] = defaultdict(list)
@@ -308,6 +354,36 @@ class RpgMakerCoverageAuditor:
                 }
             else:
                 self._discovery_by_command = {}
+        if active_inventory is not None:
+            visibility = analyze_plugin_visibility(
+                active_inventory,
+                command_discovery=discovery,
+            )
+            report.plugin_visibility = visibility.to_json_dict()
+            existing = {
+                (
+                    item.code,
+                    Path(item.file).name if item.file else "",
+                    item.reason,
+                )
+                for item in report.issues
+            }
+            for item in visibility.issues:
+                key = (
+                    item.code,
+                    Path(item.source_file).name if item.source_file else "",
+                    item.reason,
+                )
+                if key not in existing:
+                    report.issues.append(
+                        AuditIssue(
+                            item.severity,
+                            item.code,
+                            item.source_file or "",
+                            item.reason,
+                        )
+                    )
+                    existing.add(key)
         counters: dict[int, Counter[str]] = defaultdict(Counter)
         move_counters: dict[int, Counter[str]] = defaultdict(Counter)
         file_code_counts: dict[str, Counter[int]] = defaultdict(Counter)
@@ -338,7 +414,9 @@ class RpgMakerCoverageAuditor:
                         commands,
                     )
 
-        report.plugins = _plugin_inventory(game_directory, report.issues)
+        report.plugins = _plugin_inventory(
+            game_directory, report.issues, inventory=active_inventory
+        )
         report.database_fields = _database_inventory(game_directory, report.issues, self._data_directory)
         report.event_commands = _event_inventory(counters)
         report.move_route_commands = _move_inventory(move_counters)
@@ -629,6 +707,11 @@ class RpgMakerCoverageAuditor:
                 self._mv_plugin_prefix_counts,
                 self._discovery_by_command,
             ),
+            "plugin_visibility": {
+                key: value
+                for key, value in report.plugin_visibility.items()
+                if key not in {"findings", "issues"}
+            },
             "script_candidates": sum(item.command_code in {355, 655, 122} for item in report.candidates),
             "mirror_mismatches": sum(item.values_match is False for item in report.mirrors),
             "errors": sum(item.severity == "error" for item in report.issues),
@@ -1144,46 +1227,43 @@ def _nonempty_or_collection(value: Any) -> bool:
     return _text(value) or (isinstance(value, list) and bool(value))
 
 
-def _plugin_inventory(game: Path, issues: list[AuditIssue]) -> list[PluginInventory]:
-    config = game / "js/plugins.js"
-    if not config.is_file():
-        return []
-    if _is_linklike(config):
-        issues.append(AuditIssue("warning", "PLUGIN_METADATA_LINK_REJECTED", "js/plugins.js", "symlink or junction metadata is not scanned"))
-        return []
-    try:
-        if config.stat().st_size > MAX_PLUGIN_FILE_BYTES:
-            raise ValueError("plugins.js exceeds size limit")
-        text = config.read_text(encoding="utf-8-sig")
-        match = re.search(r"(?:var\s+)?\$plugins\s*=\s*(\[[\s\S]*\])\s*;?\s*$", text)
-        records = json.loads(match.group(1)) if match else []
-        if not isinstance(records, list):
-            records = []
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
-        issues.append(AuditIssue("warning", "PLUGIN_METADATA_ERROR", "js/plugins.js", str(exc)))
-        return []
+def _plugin_inventory(
+    game: Path,
+    issues: list[AuditIssue],
+    *,
+    inventory: ActivePluginInventory | None = None,
+) -> list[PluginInventory]:
+    if inventory is None:
+        config = game / "js/plugins.js"
+        sources = game / "js/plugins"
+        if not config.is_file() or not sources.is_dir():
+            return []
+        try:
+            inventory = load_plugin_inventory(config, sources)
+        except (OSError, UnicodeError, ValueError) as exc:
+            issues.append(
+                AuditIssue("warning", "PLUGIN_METADATA_ERROR", "js/plugins.js", str(exc))
+            )
+            return []
+        for item in inventory.issues:
+            issues.append(
+                AuditIssue(
+                    item.severity,
+                    item.code,
+                    item.source_file or "js/plugins.js",
+                    item.reason,
+                )
+            )
     result: list[PluginInventory] = []
-    for record in records[:MAX_FILES]:
-        if not isinstance(record, dict) or not isinstance(record.get("name"), str):
-            continue
-        name = record["name"]
-        plugin_directory = (game / "js/plugins").resolve()
-        safe_name = Path(name).name == name and name not in {".", ".."}
-        source = plugin_directory / f"{name}.js"
+    for record in inventory.plugins[:MAX_FILES]:
+        name = record.name
         registered: set[str] = set()
         declared: set[str] = set()
         text_args: set[str] = set()
-        source_relative = None
-        if (
-            safe_name
-            and source.is_file()
-            and not _is_linklike(source)
-            and source.resolve().is_relative_to(plugin_directory)
-            and source.stat().st_size <= MAX_PLUGIN_FILE_BYTES
-        ):
-            source_relative = source.relative_to(game).as_posix()
+        source_relative = record.source_file if record.source_available else None
+        if record.source_available and record.source_path is not None:
             try:
-                plugin_text = source.read_text(encoding="utf-8-sig")
+                plugin_text = record.source_path.read_text(encoding="utf-8-sig")
                 registered.update(match.group(3) for match in _REGISTER_COMMAND.finditer(plugin_text))
                 last_arg: str | None = None
                 for annotation in _ANNOTATION.finditer(plugin_text):
@@ -1198,7 +1278,16 @@ def _plugin_inventory(game: Path, issues: list[AuditIssue]) -> list[PluginInvent
                         text_args.add(last_arg)
             except (OSError, UnicodeError) as exc:
                 issues.append(AuditIssue("warning", "PLUGIN_SOURCE_ERROR", source_relative, str(exc)))
-        result.append(PluginInventory(_safe_identifier(name) or "", bool(record.get("status")), source_relative, tuple(sorted(registered)), tuple(sorted(declared)), tuple(sorted(text_args))))
+        result.append(
+            PluginInventory(
+                _safe_identifier(name) or "",
+                record.enabled is True,
+                source_relative,
+                tuple(sorted(registered)),
+                tuple(sorted(declared)),
+                tuple(sorted(text_args)),
+            )
+        )
     return result
 
 

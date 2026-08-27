@@ -723,6 +723,19 @@ def _handle_rpgmaker_audit(
             f"INTERNAL={classes.get('INTERNAL', 0)}, "
             f"UNKNOWN={classes.get('UNKNOWN', 0)}"
         )
+    if report.plugin_visibility:
+        visible = report.plugin_visibility
+        classes = visible.get("classification_counts", {})
+        print(
+            "Plugin-visible analysis: "
+            f"{visible.get('active_plugin_count', 0)} active, "
+            f"{visible.get('analyzed_plugin_count', 0)} analyzed, "
+            f"VERIFIED_VISIBLE={classes.get('VERIFIED_VISIBLE', 0)}, "
+            f"CONDITIONAL_VISIBLE={classes.get('CONDITIONAL_VISIBLE', 0)}, "
+            f"INTERNAL={classes.get('INTERNAL', 0)}, "
+            f"UNSAFE={classes.get('UNSAFE', 0)}, "
+            f"UNKNOWN={classes.get('UNKNOWN', 0)}"
+        )
     print(f"Script candidates: {stats['script_candidates']}")
     database = stats["database_coverage"]
     print(

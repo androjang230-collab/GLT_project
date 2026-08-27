@@ -117,6 +117,7 @@ class RpgMakerCoverageReport:
     issues: list[AuditIssue] = field(default_factory=list)
     statistics: dict[str, Any] = field(default_factory=dict)
     plugin_discovery: dict[str, Any] = field(default_factory=dict)
+    plugin_visibility: dict[str, Any] = field(default_factory=dict)
     actual_files_scanned: tuple[str, ...] = ()
 
     @property
