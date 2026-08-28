@@ -77,6 +77,21 @@ class RpgMakerPluginApplyTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _write_event_notes(self, *notes: str) -> None:
+        events: list[object] = [None]
+        events.extend(
+            {"id": index, "name": "", "note": note, "pages": []}
+            for index, note in enumerate(notes, 1)
+        )
+        (self.game / "data/Map001.json").write_text(
+            json.dumps(
+                {"displayName": "", "events": events},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+
     def _plugin_entries(self, contract_type: str | None = None):
         result = RpgMakerExtractor(EngineId.RPGMAKER_MV).extract(self.game)
         self.assertFalse(result.issues)
@@ -121,6 +136,20 @@ var body = lines.slice(1, 2);
 if (line.match(/^<HELP>/)) { start = true; }
 if (line.match(/^<\/HELP>/)) { start = false; }
 this._helpWindow.setText(body);
+""",
+        )
+
+    def _write_tokenized_meta_plugin(self) -> None:
+        self._write_plugins(
+            {},
+            """
+FloatingPanel.prototype.readTag = function(keyName) { return this.event().meta[keyName]; };
+FloatingPanel.prototype.setup = function() {
+  var raw = this.readTag('displayTag');
+  var fields = raw.split('|');
+  this._caption = fields[0];
+};
+FloatingPanel.prototype.redraw = function() { this.drawText(this._caption, 0, 0, 200); };
 """,
         )
 
@@ -417,6 +446,56 @@ this.drawText(label, 0, 0, 200);
         self.assertEqual(0, report.applicable)
         self.assertIn(
             "PLUGIN_CONTRACT_UNSUPPORTED", {issue.code for issue in report.issues}
+        )
+
+    def test_tokenized_dynamic_meta_apply_changes_only_visible_segment(self) -> None:
+        self._write_event_notes("<displayTag:Visible Name|12|black>")
+        self._write_tokenized_meta_plugin()
+        entry = self._plugin_entries(
+            ContractType.TOKENIZED_VISIBLE_SEGMENT.value
+        )[0]
+        self._write_translations([entry], ["표시 이름"])
+
+        dry = RpgMakerInserter(EngineId.RPGMAKER_MV).preflight(
+            self.game, self.translation
+        ).report
+        report = RpgMakerInserter(EngineId.RPGMAKER_MV).apply(
+            self.game, self.translation, self.output
+        )
+
+        output_map = json.loads(
+            (self.output / "data/Map001.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(1, dry.applicable)
+        self.assertEqual(1, report.applied)
+        self.assertEqual(
+            "<displayTag:표시 이름|12|black>",
+            output_map["events"][1]["note"],
+        )
+        original_map = json.loads(
+            (self.game / "data/Map001.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            "<displayTag:Visible Name|12|black>",
+            original_map["events"][1]["note"],
+        )
+
+    def test_tokenized_dynamic_meta_source_change_is_rejected(self) -> None:
+        self._write_event_notes("<displayTag:Visible|12|black>")
+        self._write_tokenized_meta_plugin()
+        entry = self._plugin_entries(
+            ContractType.TOKENIZED_VISIBLE_SEGMENT.value
+        )[0]
+        self._write_translations([entry], ["표시"])
+        self._write_event_notes("<displayTag:Changed|12|black>")
+
+        report = RpgMakerInserter(EngineId.RPGMAKER_MV).preflight(
+            self.game, self.translation
+        ).report
+
+        self.assertEqual(0, report.applicable)
+        self.assertIn(
+            "SOURCE_TEXT_MISMATCH", {issue.code for issue in report.issues}
         )
 
     def test_standard_and_contract_apply_share_the_safe_pipeline(self) -> None:

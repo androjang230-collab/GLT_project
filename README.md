@@ -1,14 +1,16 @@
 # Game Localization Toolkit (GLT)
 
 Windows 11에서 일본 동인게임의 번역 가능한 문자열을 안전하게 다루기 위한
-개인용 Python 도구입니다. 현재 버전은 **GLT 0.9.0**이며 RPG Maker MV/MZ의
+개인용 Python 도구입니다. 현재 버전은 **GLT 0.9.1**이며 RPG Maker MV/MZ의
 엔진 감지, UTF-8 JSONL 추출, 별도 폴더 안전 적용, 독립 QA, dry-run,
 fingerprint와 이식 가능한 번역 Project, 사용자 Glossary 및 JSONL Translation
 Memory, 폰트 진단과 안전한 기본 폰트 패치를 구현합니다. 대용량 번역 JSONL은
 독립 Split/Merge 유틸리티로 나누고 무결성을 검증하며 다시 합칠 수 있습니다.
 RPG Maker의 활성 plugin registry와 JavaScript를 실행하지 않는 bounded static
 analysis로 조사하여, 검증된 plugin parameter와 note block text를 같은 안전한
-extract/QA/apply 흐름에 연결합니다.
+extract/QA/apply 흐름에 연결합니다. 고정 key로 해석되는 dynamic meta source가
+bounded property state를 거쳐 나중에 표시되는 경우에도 실제 note의 표시 segment만
+정확히 결합하고 주변 grammar를 보존해 적용할 수 있습니다.
 WOLF RPG Editor는 자동 감지, archive 조사, 공식 `.Auto.txt`의 구조 분석·추출·QA·
 안전 적용과 격리된 official Editor Text I/O validation을 지원합니다.
 
@@ -194,7 +196,7 @@ DB 파일은 다음 필드만 명시적으로 처리합니다.
 `switches`와 `variables`를 추출하지 않습니다. 별도로 검증된 plugin command와
 아래 contract만 명시적인 예외입니다.
 
-## 0.9.0 RPG Maker plugin-visible text
+## 0.9.1 RPG Maker plugin-visible text
 
 0.9.0은 활성 plugin inventory를 `js/plugins.js`의 load order와 연결하고,
 plugin JavaScript를 실행하지 않는 bounded static analysis로
@@ -208,27 +210,45 @@ source → transform → sink 근거를 수집합니다. 표시 효과가 있다
 - `UNSAFE_TEXT`: 실행 가능한 구문 또는 안전하지 않은 흐름에 도달함
 - `UNKNOWN`: source, transform, sink 또는 저장 경계를 확정할 수 없음
 
-0.9.0의 완전한 round-trip contract는 다음 두 가지입니다.
+0.9.1은 다음 bounded behavioral flow를 추가로 추적합니다.
+
+```text
+dynamic meta source
+→ parse / transform
+→ bounded property-state propagation
+→ delayed display sink
+```
+
+Dynamic meta key는 local literal, 단순 alias, 고정 plugin parameter, bounded
+literal-return helper 또는 함수에 전달된 단일 고정 literal argument로 확정되는
+경우에만 사용합니다. 직접 object-property assignment/read는 최대 2 state hop,
+표시 helper path는 기존의 작은 depth bound 안에서만 연결합니다.
+
+0.9.1의 완전한 round-trip contract는 다음 세 가지입니다.
 
 - `scalar_parameter_text`: `plugins.js`의 검증된 scalar parameter string token
 - `delimited_block_text`: data JSON note에서 검증된 delimiter 사이의 body
+- `tokenized_visible_segment`: dynamic meta value에서 실제 display sink에 도달하는
+  결정적 token segment
 
-`regex_capture_text`, `meta_value_text`, `tokenized_visible_segment`는 contract
-모델에 존재할 수 있지만 0.9.0 apply 대상이 아닙니다. Apply는 현재 게임을 다시
+`regex_capture_text`와 `meta_value_text`는 contract 모델에 존재할 수 있지만
+0.9.1 apply 대상이 아닙니다. Apply는 현재 게임을 다시
 분석하여 storage identity, original, contract/source/grammar fingerprint와 span을
 검증합니다. `plugins.js`는 전체 재직렬화 없이 정확한 string token만 patch하고,
-note는 delimiter와 주변 내용을 유지한 채 body만 재구성합니다. 겹치는 edit는
+note는 delimiter와 주변 내용을 유지한 채 body 또는 승인된 token만 재구성합니다.
+예를 들어 `<tag:Visible Text|12|black>`에서 grammar가 첫 `|` 앞 segment만 표시한다면
+`Visible Text`만 번역하며 tag syntax, `12`, `black`은 바꾸지 않습니다. 겹치는 edit는
 차단하며 staging copy, structural comparison 및 atomic write를 계속 사용합니다.
 이미 같은 값인 plugin contract 번역은 `NO_CHANGE`로 보고하고 write plan에서
 제외합니다. JSONL 및 artifact schema는 계속 version 1입니다.
 
 분석기는 JavaScript, `eval`, `Function()` 또는 외부 JS engine을 실행하지 않습니다.
-기본적으로 활성 plugin만 분석하며 false positive보다 누락을 우선합니다. Dynamic
-meta property, 지연된 object-property rendering, JSON-in-string parameter,
-computed `PluginManager.parameters` argument, 복잡한 callback/closure, 임의 object
-state propagation 및 obfuscated/minified source는 audit-only 또는 `UNKNOWN`으로
-남을 수 있습니다. 상세 구조와 검증 결과는
-[RPG Maker plugin-visible contracts](docs/rpgmaker_plugin_visibility_0.9.0.md)에
+기본적으로 활성 plugin만 분석하며 false positive보다 누락을 우선합니다. 해결되지
+않은 dynamic concatenation과 runtime key, callback/async/closure, arbitrary object
+graph, ambiguous receiver alias, multiple unresolved writer, 중복 meta source binding,
+computed `PluginManager.parameters` argument 및 obfuscated/minified source는
+audit-only 또는 `UNKNOWN`으로 남습니다. 상세 구조와 검증 결과는
+[RPG Maker plugin-visible contracts](docs/rpgmaker_plugin_visibility_0.9.1.md)에
 정리되어 있습니다.
 
 ## JSONL 형식
@@ -1069,3 +1089,13 @@ delimited note block은 JSONL extraction과 안전한 contract-aware apply를 �
 실게임에서 66개 항목의 dry-run과 선택 항목 round-trip을 수행해 ID/storage identity,
 plugin registry 표현 및 note 의미 구조 보존을 확인했습니다. Schema version 1과
 기존 RPG Maker/WOLF 동작은 유지됩니다.
+
+## 0.9.1 dynamic-meta tokenized contracts
+
+고정 key로 해석되는 generic dynamic-meta source, 최대 2회의 property-state 전파와
+bounded delayed-render helper flow를 추가했습니다. 표시 sink에 도달하는 segment만
+`tokenized_visible_segment`로 실제 note substring에 결합하며, apply는 tag와
+formatting/control token을 유지하고 승인된 span만 교체합니다. 실게임 43개 전체
+preflight, 대표 8개 round-trip, 재추출 ID/storage identity 및 `NO_CHANGE` 안정성을
+검증했습니다. 서로 다른 plugin/tag/property 이름의 synthetic regression도 같은
+behavioral classification과 contract를 통과합니다. Schema version 1은 유지됩니다.

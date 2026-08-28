@@ -36,6 +36,7 @@ from engines.rpgmaker.plugin_contracts import (
     SemanticRole,
     resolve_delimited_block_spans,
     resolve_plugin_parameter_binding,
+    resolve_tokenized_meta_spans,
 )
 from engines.rpgmaker.validator import (
     JapaneseAllowlist,
@@ -803,6 +804,7 @@ _SUPPORTED_PLUGIN_CONTRACT_TYPES = frozenset(
     {
         ContractType.SCALAR_PARAMETER_TEXT.value,
         ContractType.DELIMITED_BLOCK_TEXT.value,
+        ContractType.TOKENIZED_VISIBLE_SEGMENT.value,
     }
 )
 _PLUGIN_METADATA_PRECONDITIONS = (
@@ -909,7 +911,16 @@ def _build_plugin_storage_plan(
         return _build_scalar_parameter_plan(
             game_directory, record, canonical, report
         )
-    return _build_delimited_block_plan(
+    if contract_type == ContractType.DELIMITED_BLOCK_TEXT.value:
+        return _build_delimited_block_plan(
+            game_directory,
+            record,
+            canonical,
+            path_tokens,
+            documents,
+            report,
+        )
+    return _build_tokenized_meta_plan(
         game_directory,
         record,
         canonical,
@@ -1125,6 +1136,114 @@ def _build_delimited_block_plan(
     )
 
 
+def _build_tokenized_meta_plan(
+    game_directory: Path,
+    record: TranslationRecord,
+    canonical: TranslationEntry,
+    path_tokens: tuple[JsonPathToken, ...],
+    documents: dict[str, Any],
+    report: ApplyReport,
+) -> _PluginValidatedRecord | None:
+    metadata = canonical.extra_metadata
+    if (
+        not _is_safe_data_path(canonical.file)
+        or metadata.get("storage_type") != "data_json_note_field"
+        or not path_tokens
+    ):
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="PLUGIN_STORAGE_IDENTITY_MISMATCH",
+                reason="tokenized meta text is not bound to an exact data JSON note field",
+            )
+        )
+        return None
+    document = documents.get(record.file)
+    if document is None:
+        source = game_directory.joinpath(*PurePosixPath(record.file).parts)
+        try:
+            document = json.loads(source.read_bytes().decode("utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            report.issues.append(
+                _record_issue(
+                    record,
+                    severity="error",
+                    code="MALFORMED_SOURCE_JSON",
+                    reason=str(exc),
+                )
+            )
+            return None
+        documents[record.file] = document
+    try:
+        note = get_json_value(document, path_tokens)
+    except JsonPathError as exc:
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="INVALID_JSON_PATH",
+                reason=str(exc),
+            )
+        )
+        return None
+    if not isinstance(note, str):
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="INVALID_TARGET_TYPE",
+                reason="plugin note target is not a string",
+            )
+        )
+        return None
+    parser_rule = metadata.get("parser_evidence")
+    ordinal = metadata.get("segment_ordinal")
+    start = metadata.get("segment_start")
+    end = metadata.get("segment_end")
+    spans = (
+        resolve_tokenized_meta_spans(note, parser_rule)
+        if isinstance(parser_rule, str)
+        else ()
+    )
+    if (
+        not isinstance(ordinal, int)
+        or isinstance(ordinal, bool)
+        or not isinstance(start, int)
+        or isinstance(start, bool)
+        or not isinstance(end, int)
+        or isinstance(end, bool)
+        or not 0 <= ordinal < len(spans)
+        or spans[ordinal] != (start, end)
+        or note[start:end] != record.original
+        or _sha256_text(note) != metadata.get("source_fingerprint")
+    ):
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="conflict",
+                code="PLUGIN_SOURCE_PRECONDITION_FAILED",
+                reason=(
+                    "current note tag grammar, token ordinal, source fingerprint, "
+                    "span, or visible segment changed"
+                ),
+            )
+        )
+        return None
+    return _PluginValidatedRecord(
+        record=record,
+        canonical=canonical,
+        contract_type=ContractType.TOKENIZED_VISIBLE_SEGMENT.value,
+        storage_identity=str(metadata["storage_identity"]),
+        span_start=start,
+        span_end=end,
+        expected_segment=record.original,
+        replacement_segment=record.translation,
+        expected_storage_value=note,
+        path_tokens=path_tokens,
+    )
+
+
 def _block_plugin_edit_overlaps(
     plans: list[_ApplyPlan],
     report: ApplyReport,
@@ -1246,7 +1365,11 @@ def _apply_plugin_validated_records(
     note_records = [
         item
         for item in records
-        if item.contract_type == ContractType.DELIMITED_BLOCK_TEXT.value
+        if item.contract_type
+        in {
+            ContractType.DELIMITED_BLOCK_TEXT.value,
+            ContractType.TOKENIZED_VISIBLE_SEGMENT.value,
+        }
     ]
     if scalar_records:
         _apply_scalar_parameter_records(
@@ -1386,7 +1509,11 @@ def _apply_delimited_block_records(
                 continue
             parser_rule = first.canonical.extra_metadata.get("parser_evidence")
             current_spans = (
-                resolve_delimited_block_spans(current, parser_rule)
+                _resolve_plugin_note_spans(
+                    current,
+                    parser_rule,
+                    first.contract_type,
+                )
                 if isinstance(current, str) and isinstance(parser_rule, str)
                 else ()
             )
@@ -1460,6 +1587,18 @@ def _apply_delimited_block_records(
         if relative_file not in report.modified_files:
             report.modified_files.append(relative_file)
         report.applied += len(applied_records)
+
+
+def _resolve_plugin_note_spans(
+    value: str,
+    parser_rule: str,
+    contract_type: str,
+) -> tuple[tuple[int, int], ...]:
+    if contract_type == ContractType.DELIMITED_BLOCK_TEXT.value:
+        return resolve_delimited_block_spans(value, parser_rule)
+    if contract_type == ContractType.TOKENIZED_VISIBLE_SEGMENT.value:
+        return resolve_tokenized_meta_spans(value, parser_rule)
+    return ()
 
 
 def _build_storage_plan(

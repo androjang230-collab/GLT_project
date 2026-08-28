@@ -239,6 +239,7 @@ _APPLY_SUPPORTED_CONTRACTS = frozenset(
     {
         ContractType.SCALAR_PARAMETER_TEXT.value,
         ContractType.DELIMITED_BLOCK_TEXT.value,
+        ContractType.TOKENIZED_VISIBLE_SEGMENT.value,
     }
 )
 
@@ -395,6 +396,14 @@ def classify_semantic_role(
 
     if finding.classification == VisibilityClassification.UNSAFE.value:
         return SemanticRole.UNSAFE_TEXT, "visibility evidence reaches unsafe syntax use"
+    if (
+        finding.resolved_key is not None
+        and finding.classification != VisibilityClassification.VERIFIED_VISIBLE.value
+    ):
+        return (
+            SemanticRole.UNKNOWN,
+            "dynamic-meta text requires a fully verified delayed-render path",
+        )
     if value is not None and not value:
         return SemanticRole.UNKNOWN, "blank scalar parameter is not a translation unit"
     if visible and (formatting or numeric):
@@ -556,6 +565,21 @@ def _meta_value_template(
     key = match.group("dot") or match.group("bracket")
     if not key or _owner_files(owner) is None:
         return None
+    tokenized = _tokenized_transform(finding.transform_evidence)
+    if tokenized is not None:
+        delimiter, segment_index = tokenized
+        parser_rule = _tokenized_meta_parser_rule(key, delimiter, segment_index)
+        return _ContractTemplate(
+            ContractType.TOKENIZED_VISIBLE_SEGMENT,
+            "meta",
+            finding.source_access,
+            parser_rule,
+            finding.sink or "",
+            finding.transform_evidence,
+            "preserve_tag_and_nonvisible_tokens",
+            owner=owner,
+            meta_key=key,
+        )
     return _ContractTemplate(
         ContractType.META_VALUE_TEXT,
         "meta",
@@ -645,6 +669,14 @@ def _claims_for_note_contract(
             )
             for ordinal, match in enumerate(pattern.finditer(storage.value)):
                 start, end = match.span("value")
+                if end > start and storage.value[start:end].strip():
+                    result.append(
+                        _note_claim(storage, start, end, contract, finding, ordinal)
+                    )
+        elif template.contract_type == ContractType.TOKENIZED_VISIBLE_SEGMENT:
+            for ordinal, (start, end) in enumerate(
+                resolve_tokenized_meta_spans(storage.value, contract.parser_rule)
+            ):
                 if end > start and storage.value[start:end].strip():
                     result.append(
                         _note_claim(storage, start, end, contract, finding, ordinal)
@@ -1178,6 +1210,92 @@ def resolve_delimited_block_spans(
     return tuple(_delimited_body_spans(text, parts[0], parts[1]))
 
 
+def _tokenized_transform(
+    transforms: Sequence[str],
+) -> tuple[str, int] | None:
+    delimiters: list[str] = []
+    segments: list[int] = []
+    for transform in transforms:
+        if transform.startswith("split_delimiter="):
+            try:
+                value = json.loads(transform.partition("=")[2])
+            except json.JSONDecodeError:
+                return None
+            if isinstance(value, str) and value:
+                delimiters.append(value)
+        match = re.fullmatch(r"segment\[(\d+)\]", transform)
+        if match is not None:
+            segments.append(int(match.group(1)))
+    if len(set(delimiters)) != 1 or len(set(segments)) != 1:
+        return None
+    return delimiters[0], segments[0]
+
+
+def _tokenized_meta_parser_rule(key: str, delimiter: str, segment: int) -> str:
+    grammar = json.dumps(
+        {"delimiter": delimiter, "key": key, "segment": segment},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "tokenized_meta:" + grammar
+
+
+def resolve_tokenized_meta_spans(
+    text: str,
+    parser_rule: str,
+) -> tuple[tuple[int, int], ...]:
+    """Re-resolve one visible token in an exact RPG Maker note tag.
+
+    Duplicate keys in one note are intentionally rejected because RPG Maker's
+    derived ``meta`` object no longer exposes a unique writable source span.
+    """
+
+    prefix = "tokenized_meta:"
+    if not parser_rule.startswith(prefix):
+        return ()
+    try:
+        grammar = json.loads(parser_rule[len(prefix) :])
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(grammar, dict):
+        return ()
+    key = grammar.get("key")
+    delimiter = grammar.get("delimiter")
+    segment = grammar.get("segment")
+    if (
+        not isinstance(key, str)
+        or not key
+        or not isinstance(delimiter, str)
+        or not delimiter
+        or not isinstance(segment, int)
+        or isinstance(segment, bool)
+        or segment < 0
+    ):
+        return ()
+
+    tags = [
+        match
+        for match in re.finditer(r"<(?P<key>[^<>:]+):(?P<value>[^<>]*)>", text)
+        if match.group("key") == key
+    ]
+    if len(tags) != 1:
+        return ()
+    match = tags[0]
+    value = match.group("value")
+    cursor = 0
+    for index in range(segment):
+        boundary = value.find(delimiter, cursor)
+        if boundary < 0:
+            return ()
+        cursor = boundary + len(delimiter)
+    boundary = value.find(delimiter, cursor)
+    local_end = len(value) if boundary < 0 else boundary
+    start = match.start("value") + cursor
+    end = match.start("value") + local_end
+    return ((start, end),)
+
+
 def _spans_overlap(left: StorageBinding, right: StorageBinding) -> bool:
     return max(left.segment_start, right.segment_start) < min(
         left.segment_end, right.segment_end
@@ -1267,4 +1385,5 @@ __all__ = [
     "extract_plugin_consumed_text",
     "resolve_delimited_block_spans",
     "resolve_plugin_parameter_binding",
+    "resolve_tokenized_meta_spans",
 ]

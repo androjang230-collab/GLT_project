@@ -7,6 +7,7 @@ explainable source-to-sink path that a later contract layer may consume.
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
@@ -30,6 +31,7 @@ from engines.rpgmaker.plugin_inventory import PluginInventory, PluginRecord
 
 
 MAX_HELPER_DEPTH = 2
+MAX_PROPERTY_HOPS = 2
 
 
 class VisibilityClassification(str, Enum):
@@ -64,6 +66,10 @@ class PluginVisibilityFinding:
     source_identity: str = field(repr=False)
     mixed_use: bool = False
     ambiguity: tuple[str, ...] = ()
+    resolved_key: str | None = None
+    resolution_path: tuple[str, ...] = ()
+    state_path: tuple[str, ...] = ()
+    property_hops: int = 0
 
     def to_json_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -111,6 +117,35 @@ class _Usage:
     unresolved: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class _FlowEdge:
+    target: str
+    transforms: tuple[str, ...] = ()
+    helper: str | None = None
+    property_hop: int = 0
+    evidence: str | None = None
+    uncertain: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _FlowSink:
+    kind: str
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DynamicMetaSource:
+    node: str
+    identity: str
+    owner: str
+    key: str | None
+    access: str
+    resolution_path: tuple[str, ...]
+    scope: str
+    raw_access: str
+    unresolved_reason: str | None = None
+
+
 _ASSIGNMENT = re.compile(
     r"\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;]+);",
     re.M,
@@ -132,6 +167,25 @@ _META_ACCESS = re.compile(
 )
 _DYNAMIC_META_ACCESS = re.compile(
     r"\b(?:(?P<object>[A-Za-z_$][\w$]*)\.)?meta\s*\[\s*(?!['\"])([^\]]+)\]"
+)
+_BOUNDED_DYNAMIC_META_ACCESS = re.compile(
+    r"(?P<receiver>(?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*(?:\(\))?)"
+    r"\.meta\s*\[\s*(?!['\"])(?P<key>[^\]]+)\]"
+)
+_FLOW_ASSIGNMENT = re.compile(
+    r"(?<![\w$.])(?:(?:var|let|const)\s+)?"
+    r"(?P<lhs>(?:this|[A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*)"
+    r"\s*(?<![=!<>])=(?!=)\s*(?P<rhs>[^;]+);",
+    re.M,
+)
+_RETURN_EXPRESSION = re.compile(r"\breturn\s+(?P<value>[^;]+);")
+_PROPERTY_EXPRESSION = re.compile(
+    r"\b(?P<value>(?:this|[A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)+)"
+)
+_STRING_LITERAL = re.compile(r"^(['\"])(?P<value>(?:\\.|(?!\1).)*)\1$")
+_SEGMENT_ACCESS = re.compile(r"\[\s*(?P<index>\d+)\s*\]")
+_KNOWN_META_OWNERS = frozenset(
+    {"actor", "class", "item", "weapon", "armor", "skill", "state", "enemy", "event"}
 )
 _TRANSFORMS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\.match\s*\(\s*/[^/\n]+/[gimuy]*\s*\)"), "literal_regex_match"),
@@ -366,7 +420,840 @@ def _analyze_source(
                 mixed_use=mixed,
             )
         )
+    dynamic_findings = _bounded_dynamic_meta_findings(
+        plugin,
+        source,
+        functions,
+        max_helper_depth=max_helper_depth,
+    )
+    if dynamic_findings:
+        findings = [
+            item
+            for item in findings
+            if not item.source_identity.startswith("meta_dynamic:")
+        ]
+        findings.extend(dynamic_findings)
     return findings
+
+
+def _bounded_dynamic_meta_findings(
+    plugin: PluginRecord,
+    source: str,
+    functions: list[object],
+    *,
+    max_helper_depth: int,
+) -> list[PluginVisibilityFinding]:
+    """Trace only resolved dynamic-meta values through a small lexical graph.
+
+    The graph is deliberately narrower than JavaScript semantics: local variables,
+    direct calls, unique method names, and at most two direct object-property writes.
+    It does not model callbacks, containers, prototype mutation, or runtime keys.
+    """
+
+    contexts = _flow_contexts(source, functions)
+    literal_helpers = _literal_helper_returns(functions)
+    constants = {
+        scope: _literal_constants(body, parameters, plugin, literal_helpers)
+        for scope, _, body, parameters in contexts
+    }
+    dynamic_sources = _dynamic_meta_sources(
+        contexts,
+        functions,
+        constants,
+        literal_helpers,
+    )
+    if not dynamic_sources:
+        return []
+
+    edges: dict[str, list[_FlowEdge]] = defaultdict(list)
+    sinks: dict[str, list[_FlowSink]] = defaultdict(list)
+    property_writers: dict[str, set[str]] = defaultdict(set)
+    property_reads: dict[str, tuple[str, str]] = {}
+    local_names: dict[str, set[str]] = {}
+
+    sources_by_scope: dict[str, list[_DynamicMetaSource]] = defaultdict(list)
+    for item in dynamic_sources:
+        sources_by_scope[item.scope].append(item)
+
+    for scope, owner, body, parameters in contexts:
+        names = set(parameters)
+        assignments = list(_flow_assignments(body))
+        for lhs, _ in assignments:
+            if "." not in lhs:
+                names.add(lhs)
+        local_names[scope] = names
+
+        for lhs, rhs in assignments:
+            target = _flow_target_node(lhs, scope, owner)
+            if target is None:
+                continue
+            transforms = _flow_transforms(rhs)
+            dependencies = _flow_expression_nodes(
+                rhs,
+                scope,
+                owner,
+                names,
+                functions,
+                sources_by_scope.get(scope, ()),
+                property_reads,
+            )
+            property_hop = 1 if target.startswith("prop:") else 0
+            if target.startswith("prop:"):
+                property_writers[target].add(_normalized_expression(rhs))
+            for dependency in dependencies:
+                edges[dependency].append(
+                    _FlowEdge(
+                        target,
+                        transforms,
+                        property_hop=property_hop,
+                        evidence=(
+                            f"property_write:{target.removeprefix('prop:')}"
+                            if property_hop
+                            else None
+                        ),
+                    )
+                )
+
+        return_node = f"return:{scope}"
+        for match in _RETURN_EXPRESSION.finditer(body):
+            value = match.group("value")
+            for dependency in _flow_expression_nodes(
+                value,
+                scope,
+                owner,
+                names,
+                functions,
+                sources_by_scope.get(scope, ()),
+                property_reads,
+            ):
+                edges[dependency].append(
+                    _FlowEdge(return_node, _flow_transforms(value))
+                )
+
+        for callee, arguments in _iter_named_calls(body):
+            direct = _direct_sink(callee, include_heuristic=False)
+            if direct is None:
+                direct = _direct_sink(callee)
+            if direct is not None:
+                argument_index, sink = direct
+                if argument_index < len(arguments):
+                    for dependency in _flow_expression_nodes(
+                        arguments[argument_index],
+                        scope,
+                        owner,
+                        names,
+                        functions,
+                        sources_by_scope.get(scope, ()),
+                        property_reads,
+                    ):
+                        sinks[dependency].append(_FlowSink("visible", sink))
+                continue
+
+            short = _short_function_name(callee)
+            if short in _INTERNAL_CALLS | {"eval"} and arguments:
+                kind = "unsafe" if short == "eval" else "internal"
+                for dependency in _flow_expression_nodes(
+                    arguments[0],
+                    scope,
+                    owner,
+                    names,
+                    functions,
+                    sources_by_scope.get(scope, ()),
+                    property_reads,
+                ):
+                    sinks[dependency].append(_FlowSink(kind, short))
+
+            helper = _resolve_flow_function(callee, functions)
+            if helper is None:
+                continue
+            helper_scope = getattr(helper, "name")
+            helper_parameters = tuple(getattr(helper, "parameters"))
+            for index, argument in enumerate(arguments[: len(helper_parameters)]):
+                target = f"var:{helper_scope}:{helper_parameters[index]}"
+                for dependency in _flow_expression_nodes(
+                    argument,
+                    scope,
+                    owner,
+                    names,
+                    functions,
+                    sources_by_scope.get(scope, ()),
+                    property_reads,
+                ):
+                    edges[dependency].append(
+                        _FlowEdge(
+                            target,
+                            _flow_transforms(argument),
+                            helper=_short_function_name(helper_scope),
+                            evidence=f"direct_call:{_short_function_name(helper_scope)}",
+                        )
+                    )
+
+        _add_literal_comparison_sinks(body, scope, owner, names, sinks)
+
+    conflicted_properties = {
+        node for node, writers in property_writers.items() if len(writers) > 1
+    }
+    properties_by_leaf: dict[str, list[str]] = defaultdict(list)
+    for node in property_writers:
+        property_path = node.rsplit(":", 1)[-1]
+        properties_by_leaf[property_path.rsplit(".", 1)[-1]].append(node)
+    for read_node, (reader_owner, path) in property_reads.items():
+        if read_node in property_writers:
+            continue
+        leaf = path.rsplit(".", 1)[-1]
+        candidates = list(properties_by_leaf.get(leaf, ()))
+        if "." in path:
+            candidates = [
+                item
+                for item in candidates
+                if not item.startswith(f"prop:{reader_owner}:")
+            ]
+        uncertain = len(candidates) != 1
+        for candidate in candidates:
+            edges[candidate].append(
+                _FlowEdge(
+                    read_node,
+                    evidence=(
+                        "unique_property_receiver"
+                        if not uncertain
+                        else "ambiguous_property_receiver"
+                    ),
+                    uncertain=uncertain,
+                )
+            )
+
+    results: list[PluginVisibilityFinding] = []
+    for dynamic_source in dynamic_sources:
+        if dynamic_source.key is None:
+            results.append(
+                PluginVisibilityFinding(
+                    plugin_name=plugin.name,
+                    plugin_file=plugin.source_file
+                    or f"js/plugins/{plugin.name}.js",
+                    source_kind="meta",
+                    source_access=dynamic_source.access,
+                    transform_evidence=("dynamic_property",),
+                    helper_chain=(),
+                    helper_depth=0,
+                    sink=None,
+                    classification=VisibilityClassification.UNKNOWN.value,
+                    reason=dynamic_source.unresolved_reason
+                    or "dynamic meta key is not deterministically resolved",
+                    source_identity=dynamic_source.identity,
+                    resolution_path=dynamic_source.resolution_path,
+                )
+            )
+            continue
+        results.extend(
+            _trace_dynamic_source(
+                plugin,
+                dynamic_source,
+                edges,
+                sinks,
+                conflicted_properties,
+                max_helper_depth=max_helper_depth,
+            )
+        )
+
+    unique: dict[tuple[object, ...], PluginVisibilityFinding] = {}
+    for item in results:
+        key = (
+            item.source_identity,
+            item.classification,
+            item.sink,
+            item.transform_evidence,
+        )
+        unique.setdefault(key, item)
+    return list(unique.values())
+
+
+def _flow_contexts(
+    source: str,
+    functions: list[object],
+) -> list[tuple[str, str, str, tuple[str, ...]]]:
+    contexts: list[tuple[str, str, str, tuple[str, ...]]] = [
+        ("<global>", "<global>", _outside_function_bodies(source, functions), ())
+    ]
+    for function in functions:
+        name = str(getattr(function, "name"))
+        owner_match = re.match(r"(?P<owner>.+?)\.prototype\.[^.]+$", name)
+        owner = owner_match.group("owner") if owner_match else name
+        contexts.append(
+            (
+                name,
+                owner,
+                str(getattr(function, "body")),
+                tuple(getattr(function, "parameters")),
+            )
+        )
+    return contexts
+
+
+def _outside_function_bodies(source: str, functions: list[object]) -> str:
+    characters = list(source)
+    search_start = 0
+    for function in functions:
+        body = str(getattr(function, "body"))
+        start = source.find(body, search_start)
+        if start < 0:
+            start = source.find(body)
+        if start < 0:
+            continue
+        characters[start : start + len(body)] = " " * len(body)
+        search_start = start + len(body)
+    return "".join(characters)
+
+
+def _literal_helper_returns(functions: list[object]) -> dict[str, str]:
+    by_short: dict[str, list[str]] = defaultdict(list)
+    for function in functions:
+        returns = [
+            _decode_js_string_literal(match.group("value").strip())
+            for match in _RETURN_EXPRESSION.finditer(str(getattr(function, "body")))
+        ]
+        resolved = {item for item in returns if item is not None}
+        if len(returns) == 1 and len(resolved) == 1:
+            by_short[_short_function_name(str(getattr(function, "name")))].append(
+                next(iter(resolved))
+            )
+    return {
+        name: values[0]
+        for name, values in by_short.items()
+        if len(set(values)) == 1
+    }
+
+
+def _literal_constants(
+    body: str,
+    parameters: tuple[str, ...],
+    plugin: PluginRecord,
+    literal_helpers: dict[str, str],
+) -> dict[str, str]:
+    del parameters
+    assignments = list(_flow_assignments(body))
+    parameter_containers: dict[str, str] = {}
+    for lhs, rhs in assignments:
+        if "." in lhs:
+            continue
+        match = _PARAMETERS_CALL.fullmatch(rhs.strip())
+        if match is not None:
+            parameter_containers[lhs] = match.group("name")
+
+    constants: dict[str, str] = {}
+    for _ in range(4):
+        changed = False
+        for lhs, rhs in assignments:
+            if "." in lhs:
+                continue
+            value = _resolve_literal_expression(
+                rhs,
+                constants,
+                literal_helpers,
+                parameter_containers,
+                plugin,
+            )
+            if value is not None and constants.get(lhs) != value:
+                constants[lhs] = value
+                changed = True
+        if not changed:
+            break
+    return constants
+
+
+def _resolve_literal_expression(
+    expression: str,
+    constants: dict[str, str],
+    literal_helpers: dict[str, str],
+    parameter_containers: dict[str, str] | None = None,
+    plugin: PluginRecord | None = None,
+) -> str | None:
+    text = _strip_wrapping_parentheses(expression.strip())
+    literal = _decode_js_string_literal(text)
+    if literal is not None:
+        return literal
+    if text in constants:
+        return constants[text]
+    call = re.fullmatch(
+        r"(?:this\.)?(?P<name>[A-Za-z_$][\w$]*)\s*\(\s*\)", text
+    )
+    if call is not None:
+        return literal_helpers.get(call.group("name"))
+    if parameter_containers and plugin is not None:
+        match = _LITERAL_PROPERTY.fullmatch(text)
+        if match is not None and match.group("base") in parameter_containers:
+            key = match.group("dot") or match.group("bracket")
+            value = plugin.parameters.get(key)
+            return value if isinstance(value, str) else None
+    return None
+
+
+def _decode_js_string_literal(value: str) -> str | None:
+    match = _STRING_LITERAL.fullmatch(value)
+    if match is None:
+        return None
+    quote = value[0]
+    payload = value[1:-1]
+    output: list[str] = []
+    index = 0
+    escapes = {
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "b": "\b",
+        "f": "\f",
+        "v": "\v",
+        "0": "\0",
+        "\\": "\\",
+        "/": "/",
+        quote: quote,
+    }
+    while index < len(payload):
+        character = payload[index]
+        if character != "\\":
+            output.append(character)
+            index += 1
+            continue
+        if index + 1 >= len(payload):
+            return None
+        escaped = payload[index + 1]
+        if escaped in escapes:
+            output.append(escapes[escaped])
+            index += 2
+            continue
+        if escaped in {"u", "x"}:
+            width = 4 if escaped == "u" else 2
+            digits = payload[index + 2 : index + 2 + width]
+            if len(digits) != width or not re.fullmatch(r"[0-9A-Fa-f]+", digits):
+                return None
+            output.append(chr(int(digits, 16)))
+            index += 2 + width
+            continue
+        return None
+    return "".join(output)
+
+
+def _dynamic_meta_sources(
+    contexts: list[tuple[str, str, str, tuple[str, ...]]],
+    functions: list[object],
+    constants: dict[str, dict[str, str]],
+    literal_helpers: dict[str, str],
+) -> list[_DynamicMetaSource]:
+    result: list[_DynamicMetaSource] = []
+    context_by_scope = {scope: (owner, body, parameters) for scope, owner, body, parameters in contexts}
+    for scope, _, body, parameters in contexts:
+        meta_aliases: dict[str, tuple[str, str]] = {}
+        for lhs, rhs in _flow_assignments(body):
+            if "." in lhs:
+                continue
+            match = re.fullmatch(
+                r"(?P<receiver>(?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*(?:\(\))?)\.meta",
+                rhs.strip(),
+            )
+            if match is not None:
+                meta_aliases[lhs] = (
+                    _dynamic_meta_owner(match.group("receiver")),
+                    match.group("receiver"),
+                )
+
+        sites: list[tuple[int, str, str, str]] = []
+        for match in _BOUNDED_DYNAMIC_META_ACCESS.finditer(body):
+            sites.append(
+                (
+                    match.start(),
+                    match.group(0),
+                    _dynamic_meta_owner(match.group("receiver")),
+                    match.group("key").strip(),
+                )
+            )
+        for alias, (owner, receiver) in meta_aliases.items():
+            pattern = re.compile(
+                rf"\b{re.escape(alias)}\s*\[\s*(?!['\"])(?P<key>[^\]]+)\]"
+            )
+            for match in pattern.finditer(body):
+                sites.append((match.start(), match.group(0), owner, match.group("key").strip()))
+
+        for ordinal, (_, raw_access, owner, key_expression) in enumerate(sorted(sites)):
+            key = _resolve_literal_expression(
+                key_expression,
+                constants.get(scope, {}),
+                literal_helpers,
+            )
+            resolution_path: tuple[str, ...] = ()
+            unresolved_reason: str | None = None
+            if key is not None:
+                resolution_path = ("dynamic_meta_key", "fixed_literal_or_alias")
+            elif key_expression in parameters:
+                parameter_index = parameters.index(key_expression)
+                call_values: list[str] = []
+                for caller_scope, _, caller_body, _ in contexts:
+                    for callee, arguments in _iter_named_calls(caller_body):
+                        resolved = _resolve_flow_function(callee, functions)
+                        if resolved is None or getattr(resolved, "name") != scope:
+                            continue
+                        if parameter_index >= len(arguments):
+                            continue
+                        value = _resolve_literal_expression(
+                            arguments[parameter_index],
+                            constants.get(caller_scope, {}),
+                            literal_helpers,
+                        )
+                        if value is not None:
+                            call_values.append(value)
+                unique_values = sorted(set(call_values))
+                if len(unique_values) == 1:
+                    key = unique_values[0]
+                    resolution_path = (
+                        "dynamic_meta_key",
+                        f"function_parameter:{key_expression}",
+                        "fixed_call_argument",
+                    )
+                else:
+                    unresolved_reason = (
+                        "dynamic meta function parameter has no unique fixed call argument"
+                    )
+            else:
+                unresolved_reason = (
+                    "dynamic meta key is not a bounded literal, alias, plugin parameter, or literal helper result"
+                )
+
+            known_owner = owner.casefold() if owner.casefold() in _KNOWN_META_OWNERS else owner
+            identity = (
+                f"meta:{known_owner}:{key}"
+                if key is not None
+                else f"meta_dynamic:{known_owner}:{scope}:{ordinal}"
+            )
+            access = (
+                f"{known_owner}.meta[{key!r}]"
+                if key is not None
+                else f"{known_owner}.meta[<dynamic:{key_expression}>]"
+            )
+            result.append(
+                _DynamicMetaSource(
+                    node=f"source:{scope}:{ordinal}:{key or '<dynamic>'}",
+                    identity=identity,
+                    owner=known_owner,
+                    key=key,
+                    access=access,
+                    resolution_path=resolution_path,
+                    scope=scope,
+                    raw_access=raw_access,
+                    unresolved_reason=unresolved_reason,
+                )
+            )
+    return result
+
+
+def _dynamic_meta_owner(receiver: str) -> str:
+    compact = re.sub(r"\s+", "", receiver)
+    if compact.endswith(".event()") or compact == "event()":
+        return "event"
+    value = compact.rsplit(".", 1)[-1].removesuffix("()")
+    return value
+
+
+def _flow_assignments(body: str) -> Iterator[tuple[str, str]]:
+    for match in _FLOW_ASSIGNMENT.finditer(body):
+        yield match.group("lhs"), match.group("rhs").strip()
+
+
+def _flow_target_node(lhs: str, scope: str, owner: str) -> str | None:
+    if "." not in lhs:
+        return f"var:{scope}:{lhs}"
+    return _property_node(lhs, scope, owner)
+
+
+def _property_node(value: str, scope: str, owner: str) -> str | None:
+    parts = value.split(".")
+    if len(parts) < 2 or any(not re.fullmatch(r"[A-Za-z_$][\w$]*", part) for part in parts):
+        return None
+    if parts[0] == "this":
+        return f"prop:{owner}:{'.'.join(parts[1:])}"
+    return f"prop:{scope}:{value}"
+
+
+def _flow_expression_nodes(
+    expression: str,
+    scope: str,
+    owner: str,
+    local_names: set[str],
+    functions: list[object],
+    dynamic_sources: tuple[_DynamicMetaSource, ...] | list[_DynamicMetaSource],
+    property_reads: dict[str, tuple[str, str]],
+) -> set[str]:
+    nodes: set[str] = set()
+    for source in dynamic_sources:
+        if source.raw_access in expression:
+            nodes.add(source.node)
+
+    masked = _mask_js_strings(expression)
+    property_spans: list[tuple[int, int]] = []
+    for match in _PROPERTY_EXPRESSION.finditer(masked):
+        if match.end("value") < len(masked) and masked[match.end("value")] == "(":
+            continue
+        value = expression[match.start("value") : match.end("value")]
+        node = _property_node(value, scope, owner)
+        if node is None:
+            continue
+        nodes.add(node)
+        property_spans.append((match.start("value"), match.end("value")))
+        path = value.removeprefix("this.") if value.startswith("this.") else value
+        property_reads.setdefault(node, (owner, path))
+
+    variables_mask = list(masked)
+    for start, end in property_spans:
+        variables_mask[start:end] = " " * (end - start)
+    remaining = "".join(variables_mask)
+    for name in local_names:
+        if re.search(rf"\b{re.escape(name)}\b", remaining):
+            nodes.add(f"var:{scope}:{name}")
+
+    for callee, _ in _iter_named_calls(expression):
+        helper = _resolve_flow_function(callee, functions)
+        if helper is not None:
+            nodes.add(f"return:{getattr(helper, 'name')}")
+    return nodes
+
+
+def _mask_js_strings(value: str) -> str:
+    output = list(value)
+    index = 0
+    quote: str | None = None
+    while index < len(value):
+        character = value[index]
+        if quote is not None:
+            output[index] = " "
+            if character == "\\" and index + 1 < len(value):
+                output[index + 1] = " "
+                index += 2
+                continue
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"', "`"}:
+            quote = character
+            output[index] = " "
+        index += 1
+    return "".join(output)
+
+
+def _resolve_flow_function(callee: str, functions: list[object]) -> object | None:
+    short = _short_function_name(callee)
+    exact = [item for item in functions if getattr(item, "name") == callee]
+    if len(exact) == 1:
+        return exact[0]
+    candidates = [
+        item
+        for item in functions
+        if _short_function_name(str(getattr(item, "name"))) == short
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _flow_transforms(expression: str) -> tuple[str, ...]:
+    transforms: list[str] = []
+    for pattern, label in _TRANSFORMS:
+        if pattern.search(expression):
+            transforms.append(label)
+    split = re.search(r"\.split\s*\(\s*(?P<literal>['\"](?:\\.|[^'\"])*['\"])\s*\)", expression)
+    if split is not None:
+        delimiter = _decode_js_string_literal(split.group("literal"))
+        if delimiter is not None and delimiter:
+            transforms.append("split_delimiter=" + json.dumps(delimiter, ensure_ascii=False))
+    segment = _SEGMENT_ACCESS.search(expression)
+    if segment is not None:
+        transforms.append(f"segment[{segment.group('index')}]")
+    return tuple(dict.fromkeys(transforms))
+
+
+def _normalized_expression(value: str) -> str:
+    return re.sub(r"\s+", "", value)
+
+
+def _add_literal_comparison_sinks(
+    body: str,
+    scope: str,
+    owner: str,
+    local_names: set[str],
+    sinks: dict[str, list[_FlowSink]],
+) -> None:
+    literal = r"(?:'(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\")"
+    for name in local_names:
+        if re.search(
+            rf"(?:\b{re.escape(name)}\b\s*(?:===|!==|==|!=)\s*{literal}|"
+            rf"{literal}\s*(?:===|!==|==|!=)\s*\b{re.escape(name)}\b)",
+            body,
+        ):
+            sinks[f"var:{scope}:{name}"].append(
+                _FlowSink("internal", "literal comparison/control use")
+            )
+    for match in _PROPERTY_EXPRESSION.finditer(_mask_js_strings(body)):
+        value = match.group("value")
+        if not re.search(
+            rf"{re.escape(value)}\s*(?:===|!==|==|!=)\s*{literal}", body
+        ):
+            continue
+        node = _property_node(value, scope, owner)
+        if node is not None:
+            sinks[node].append(_FlowSink("internal", "literal comparison/control use"))
+
+
+def _trace_dynamic_source(
+    plugin: PluginRecord,
+    source: _DynamicMetaSource,
+    edges: dict[str, list[_FlowEdge]],
+    sinks: dict[str, list[_FlowSink]],
+    conflicted_properties: set[str],
+    *,
+    max_helper_depth: int,
+) -> list[PluginVisibilityFinding]:
+    queue: list[
+        tuple[str, tuple[str, ...], tuple[str, ...], int, tuple[str, ...], bool]
+    ] = [(source.node, (), (), 0, (), False)]
+    visited: set[tuple[str, tuple[str, ...], tuple[str, ...], int, bool]] = set()
+    reached: list[
+        tuple[_FlowSink, tuple[str, ...], tuple[str, ...], int, tuple[str, ...], bool]
+    ] = []
+    while queue and len(visited) < 2048:
+        node, transforms, helpers, hops, evidence, uncertain = queue.pop(0)
+        state = (node, transforms, helpers, hops, uncertain)
+        if state in visited:
+            continue
+        visited.add(state)
+        for sink in sinks.get(node, ()):
+            reached.append((sink, transforms, helpers, hops, evidence, uncertain))
+        for edge in edges.get(node, ()):
+            next_hops = hops + edge.property_hop
+            next_helpers = helpers + ((edge.helper,) if edge.helper else ())
+            if next_hops > MAX_PROPERTY_HOPS or len(next_helpers) > max_helper_depth:
+                continue
+            next_transforms = tuple(dict.fromkeys(transforms + edge.transforms))
+            next_evidence = evidence + ((edge.evidence,) if edge.evidence else ())
+            queue.append(
+                (
+                    edge.target,
+                    next_transforms,
+                    next_helpers,
+                    next_hops,
+                    next_evidence,
+                    uncertain or edge.uncertain or edge.target in conflicted_properties,
+                )
+            )
+
+    visible = [item for item in reached if item[0].kind == "visible"]
+    internal = [item for item in reached if item[0].kind == "internal"]
+    unsafe = [item for item in reached if item[0].kind == "unsafe"]
+    if not visible:
+        if unsafe:
+            classification = VisibilityClassification.UNSAFE
+            reason = "resolved dynamic meta reaches an unsafe syntax sink"
+            selected = unsafe[0]
+        elif internal:
+            classification = VisibilityClassification.INTERNAL
+            reason = "resolved dynamic meta is consumed only by control/config logic"
+            selected = internal[0]
+        else:
+            classification = VisibilityClassification.UNKNOWN
+            reason = "resolved dynamic meta does not reach a bounded display sink"
+            selected = (_FlowSink("unknown", ""), (), (), 0, (), False)
+        return [
+            _dynamic_finding(
+                plugin,
+                source,
+                selected,
+                classification,
+                reason,
+                mixed=False,
+            )
+        ]
+
+    grouped: dict[int | None, list[tuple[object, ...]]] = defaultdict(list)
+    for item in visible:
+        grouped[_segment_index(item[1])].append(item)
+    results: list[PluginVisibilityFinding] = []
+    for segment, candidates in grouped.items():
+        selected = sorted(
+            candidates,
+            key=lambda item: (item[5], item[3], len(item[2]), len(item[1])),
+        )[0]
+        same_internal = [
+            item for item in internal if _segment_index(item[1]) in {None, segment}
+        ]
+        same_unsafe = [
+            item for item in unsafe if _segment_index(item[1]) in {None, segment}
+        ]
+        mixed = bool(same_internal or same_unsafe)
+        if same_unsafe:
+            classification = VisibilityClassification.UNSAFE
+            reason = "visible dynamic-meta segment also reaches unsafe syntax use"
+        elif mixed or selected[5]:
+            classification = VisibilityClassification.CONDITIONAL_VISIBLE
+            reason = (
+                "display flow exists but the same segment has mixed or ambiguous state propagation"
+            )
+        else:
+            classification = VisibilityClassification.VERIFIED_VISIBLE
+            reason = (
+                "deterministic dynamic key and bounded property-to-display flow"
+            )
+        results.append(
+            _dynamic_finding(
+                plugin,
+                source,
+                selected,
+                classification,
+                reason,
+                mixed=mixed,
+                segment=segment,
+            )
+        )
+    return results
+
+
+def _segment_index(transforms: tuple[str, ...]) -> int | None:
+    values = [
+        int(match.group(1))
+        for item in transforms
+        if (match := re.fullmatch(r"segment\[(\d+)\]", item))
+    ]
+    return values[-1] if values else None
+
+
+def _dynamic_finding(
+    plugin: PluginRecord,
+    source: _DynamicMetaSource,
+    reached: tuple[_FlowSink, tuple[str, ...], tuple[str, ...], int, tuple[str, ...], bool],
+    classification: VisibilityClassification,
+    reason: str,
+    *,
+    mixed: bool,
+    segment: int | None = None,
+) -> PluginVisibilityFinding:
+    sink, transforms, helpers, hops, state_path, _ = reached
+    evidence = tuple(
+        dict.fromkeys(
+            ("dynamic_property", f"resolved_key[{source.key}]") + transforms
+        )
+    )
+    identity = source.identity + (f":segment{segment}" if segment is not None else "")
+    return PluginVisibilityFinding(
+        plugin_name=plugin.name,
+        plugin_file=plugin.source_file or f"js/plugins/{plugin.name}.js",
+        source_kind="meta",
+        source_access=source.access,
+        transform_evidence=evidence,
+        helper_chain=helpers,
+        helper_depth=len(helpers),
+        sink=sink.name or None,
+        classification=classification.value,
+        reason=reason,
+        source_identity=identity,
+        mixed_use=mixed,
+        resolved_key=source.key,
+        resolution_path=source.resolution_path,
+        state_path=state_path,
+        property_hops=hops,
+    )
 
 
 def _assignments(source: str) -> Iterator[tuple[str, str]]:

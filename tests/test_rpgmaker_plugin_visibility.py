@@ -331,6 +331,113 @@ unknownCallback(value);
             },
         )
 
+    def test_dynamic_meta_literal_key_reaches_delayed_property_render(self) -> None:
+        findings = self._findings(
+            {
+                "BehaviorOne": (
+                    True,
+                    """
+Panel_A.prototype.load = function(data) {
+  var tagKey = 'displayTag';
+  var pieces = data.meta[tagKey].split(' ');
+  this._caption = pieces[0];
+};
+Panel_A.prototype.refresh = function() {
+  this.drawText(this._caption, 0, 0, 200);
+};
+""",
+                    {},
+                )
+            }
+        )
+        item = next(row for row in findings if row.resolved_key == "displayTag")
+        self.assertEqual(VisibilityClassification.VERIFIED_VISIBLE.value, item.classification)
+        self.assertEqual("drawText", item.sink)
+        self.assertIn("literal_split", item.transform_evidence)
+        self.assertIn("segment[0]", item.transform_evidence)
+        self.assertEqual(1, item.property_hops)
+
+    def test_dynamic_meta_function_parameter_without_fixed_call_is_unknown(self) -> None:
+        findings = self._findings(
+            {
+                "RuntimeKey": (
+                    True,
+                    """
+function readDynamic(data, runtimeKey) {
+  return data.meta[runtimeKey];
+}
+unknownConsumer(readDynamic(data, userInput));
+""",
+                    {},
+                )
+            }
+        )
+        item = next(row for row in findings if "<dynamic:" in row.source_access)
+        self.assertEqual(VisibilityClassification.UNKNOWN.value, item.classification)
+        self.assertIsNone(item.resolved_key)
+
+    def test_dynamic_meta_property_with_conflicting_writers_is_not_verified(self) -> None:
+        findings = self._findings(
+            {
+                "WriterConflict": (
+                    True,
+                    """
+Panel_B.prototype.load = function(data) {
+  var key = 'captionTag';
+  this._text = data.meta[key];
+};
+Panel_B.prototype.reset = function() {
+  this._text = 'fallback';
+};
+Panel_B.prototype.paint = function() {
+  this.drawText(this._text, 0, 0, 200);
+};
+""",
+                    {},
+                )
+            }
+        )
+        item = next(row for row in findings if row.resolved_key == "captionTag")
+        self.assertNotEqual(VisibilityClassification.VERIFIED_VISIBLE.value, item.classification)
+
+    def test_cross_plugin_behavior_uses_names_only_as_evidence(self) -> None:
+        sources = {
+            "FirstExample": (
+                True,
+                """
+ActorBadge.prototype.readTag = function(keyName) { return this.event().meta[keyName]; };
+ActorBadge.prototype.setup = function() {
+  var raw = this.readTag('badgeText');
+  var fields = raw.split('|');
+  this._shown = fields[0];
+};
+ActorBadge.prototype.paint = function() { this.drawText(this._shown, 0, 0, 100); };
+""",
+                {},
+            ),
+            "UnrelatedWidget": (
+                True,
+                """
+MapWidget.prototype.fetch = function(propertyCode) { return this.event().meta[propertyCode]; };
+MapWidget.prototype.prepare = function() {
+  var payload = this.fetch('floatingCaption');
+  var chunks = payload.split('|');
+  this._renderValue = chunks[0];
+};
+MapWidget.prototype.redraw = function() { this.drawText(this._renderValue, 0, 0, 100); };
+""",
+                {},
+            ),
+        }
+        findings = self._findings(sources)
+        verified = {
+            (row.plugin_name, row.resolved_key)
+            for row in findings
+            if row.classification == VisibilityClassification.VERIFIED_VISIBLE.value
+        }
+        self.assertIn(("FirstExample", "badgeText"), verified)
+        self.assertIn(("UnrelatedWidget", "floatingCaption"), verified)
+
     def test_eval_consumption_is_unsafe(self) -> None:
         findings = self._findings(
             {

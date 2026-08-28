@@ -68,6 +68,17 @@ class RpgMakerPluginContractTests(unittest.TestCase):
             json.dumps(records, ensure_ascii=False), encoding="utf-8"
         )
 
+    def _write_event_notes(self, *notes: str) -> None:
+        events: list[object] = [None]
+        events.extend(
+            {"id": index, "name": "", "note": note, "pages": []}
+            for index, note in enumerate(notes, 1)
+        )
+        (self.data / "Map001.json").write_text(
+            json.dumps({"displayName": "", "events": events}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
     def test_direct_scalar_visible_parameter_is_translatable_and_extracted(self) -> None:
         self._write_plugins(
             {
@@ -381,6 +392,142 @@ this.addCommand(label, 'go');
             "Map001:event1:page1:cmd357:index1:param3:arg:text",
             next(entry.id for entry in mz_entries if entry.original == "MZ visible"),
         )
+
+    def test_dynamic_meta_tokenized_segment_binds_exact_event_note(self) -> None:
+        self._write_event_notes("<displayTag:Visible Name|12|black>")
+        self._write_plugins(
+            {
+                "BehaviorFixture": (
+                    True,
+                    """
+FloatingPanel.prototype.read = function(keyCode) { return this.event().meta[keyCode]; };
+FloatingPanel.prototype.setup = function() {
+  var payload = this.read('displayTag');
+  var fields = payload.split('|');
+  this._caption = fields[0];
+};
+FloatingPanel.prototype.redraw = function() { this.drawText(this._caption, 0, 0, 200); };
+""",
+                    {},
+                )
+            }
+        )
+
+        first_result, first_entries, _ = self._plugin_entries(
+            RpgMakerExtractor(EngineId.RPGMAKER_MV)
+        )
+        second_result, second_entries, _ = self._plugin_entries(
+            RpgMakerExtractor(EngineId.RPGMAKER_MV)
+        )
+
+        self.assertEqual([], first_result.issues)
+        self.assertEqual([], second_result.issues)
+        self.assertEqual(1, len(first_entries))
+        entry = first_entries[0]
+        self.assertEqual("Visible Name", entry.original)
+        self.assertEqual("data/Map001.json", entry.file)
+        self.assertEqual("$.events[1].note", entry.json_path)
+        self.assertEqual(
+            ContractType.TOKENIZED_VISIBLE_SEGMENT.value,
+            entry.extra_metadata["contract_type"],
+        )
+        self.assertTrue(entry.extra_metadata["apply_supported"])
+        self.assertEqual(entry.id, second_entries[0].id)
+
+    def test_ambiguous_dynamic_meta_note_binding_is_audit_only(self) -> None:
+        self._write_event_notes("<captionTag:First|1><captionTag:Second|2>")
+        self._write_plugins(
+            {
+                "AmbiguousStorage": (
+                    True,
+                    """
+Panel.prototype.read = function(key) { return this.event().meta[key]; };
+Panel.prototype.setup = function() {
+  var raw = this.read('captionTag');
+  var values = raw.split('|');
+  this._text = values[0];
+};
+Panel.prototype.paint = function() { this.drawText(this._text, 0, 0, 100); };
+""",
+                    {},
+                )
+            }
+        )
+
+        _, entries, report = self._plugin_entries(
+            RpgMakerExtractor(EngineId.RPGMAKER_MV)
+        )
+
+        self.assertEqual([], entries)
+        finding = next(item for item in report.semantic_findings if item.source_kind == "meta")
+        self.assertEqual(SemanticRole.UNKNOWN.value, finding.semantic_role)
+
+    def test_cross_plugin_dynamic_contract_is_behavioral(self) -> None:
+        self._write_event_notes(
+            "<badgeText:Alpha|12><floatingCaption:Beta|blue>"
+        )
+        self._write_plugins(
+            {
+                "BadgeExample": (
+                    True,
+                    """
+BadgeNode.prototype.fetch = function(code) { return this.event().meta[code]; };
+BadgeNode.prototype.prepare = function() { var raw = this.fetch('badgeText'); var p = raw.split('|'); this._value = p[0]; };
+BadgeNode.prototype.paint = function() { this.drawText(this._value, 0, 0, 100); };
+""",
+                    {},
+                ),
+                "DifferentWidget": (
+                    True,
+                    """
+WidgetNode.prototype.obtain = function(propertyName) { return this.event().meta[propertyName]; };
+WidgetNode.prototype.load = function() { var data = this.obtain('floatingCaption'); var chunks = data.split('|'); this._label = chunks[0]; };
+WidgetNode.prototype.render = function() { this.drawText(this._label, 0, 0, 100); };
+""",
+                    {},
+                ),
+            }
+        )
+
+        _, entries, _ = self._plugin_entries(
+            RpgMakerExtractor(EngineId.RPGMAKER_MV)
+        )
+
+        self.assertEqual({"Alpha", "Beta"}, {entry.original for entry in entries})
+        self.assertEqual(
+            {ContractType.TOKENIZED_VISIBLE_SEGMENT.value},
+            {entry.extra_metadata["contract_type"] for entry in entries},
+        )
+
+    def test_dynamic_meta_mixed_logic_and_display_is_not_extracted(self) -> None:
+        self._write_event_notes("<mixedTag:Visible|12>")
+        self._write_plugins(
+            {
+                "MixedBehavior": (
+                    True,
+                    """
+MixedPanel.prototype.read = function(key) { return this.event().meta[key]; };
+MixedPanel.prototype.setup = function() {
+  var raw = this.read('mixedTag');
+  var parts = raw.split('|');
+  var label = parts[0];
+  if (label === 'CONTROL') { this._mode = 1; }
+  this._label = label;
+};
+MixedPanel.prototype.paint = function() { this.drawText(this._label, 0, 0, 100); };
+""",
+                    {},
+                )
+            }
+        )
+
+        _, entries, report = self._plugin_entries(
+            RpgMakerExtractor(EngineId.RPGMAKER_MV)
+        )
+
+        self.assertEqual([], entries)
+        finding = next(item for item in report.semantic_findings if item.source_kind == "meta")
+        self.assertNotEqual(SemanticRole.TRANSLATABLE_TEXT.value, finding.semantic_role)
 
 
 if __name__ == "__main__":
