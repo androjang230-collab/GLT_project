@@ -347,6 +347,55 @@ this._helpWindow.setText(body);
             dry.extra_metadata["plugin_contracts"]["planned_files"],
         )
 
+    def test_already_equal_plugin_translation_is_reported_without_write_plan(self) -> None:
+        before = self._write_plugins(
+            {"Menu Label": "Begin"}, self._scalar_source("Menu Label")
+        )
+        entry = self._plugin_entries()[0]
+        self._write_translations([entry], [entry.original])
+
+        dry = RpgMakerEngine().apply(
+            self.game,
+            self.translation,
+            self.workspace / "dry-output",
+            dry_run=True,
+        )
+
+        self.assertEqual(0, dry.applicable)
+        self.assertEqual([], dry.planned_ids)
+        self.assertEqual([], dry.planned_files)
+        self.assertEqual(1, dry.extra_metadata["plugin_contracts"]["no_change_entries"])
+        self.assertIn("NO_CHANGE", {issue.code for issue in dry.issues})
+
+        actual = RpgMakerInserter(EngineId.RPGMAKER_MV).apply(
+            self.game, self.translation, self.output
+        )
+        self.assertEqual(0, actual.applied)
+        self.assertEqual([], actual.modified_files)
+        self.assertEqual(before, (self.output / "js/plugins.js").read_bytes())
+
+    def test_already_equal_translation_does_not_bypass_source_mismatch(self) -> None:
+        self._write_plugins(
+            {"Menu Label": "Begin"}, self._scalar_source("Menu Label")
+        )
+        entry = self._plugin_entries()[0]
+        row = entry.to_json_dict()
+        row["original"] = "Stale original"
+        row["translation"] = "Begin"
+        self.translation.write_text(
+            json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+        report = RpgMakerInserter(EngineId.RPGMAKER_MV).preflight(
+            self.game, self.translation
+        ).report
+
+        self.assertEqual(0, report.applicable)
+        self.assertIn(
+            "SOURCE_TEXT_MISMATCH", {issue.code for issue in report.issues}
+        )
+        self.assertNotIn("NO_CHANGE", {issue.code for issue in report.issues})
+
     def test_unsupported_regex_contract_is_not_applied(self) -> None:
         self._write_states("<Label:Old>")
         self._write_plugins(

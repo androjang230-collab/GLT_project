@@ -573,7 +573,23 @@ class RpgMakerInserter:
                     report,
                 )
             if plan is not None:
-                validated.append(plan)
+                if (
+                    isinstance(plan, _PluginValidatedRecord)
+                    and record.translation == record.original
+                ):
+                    report.issues.append(
+                        _record_issue(
+                            record,
+                            severity="info",
+                            code="NO_CHANGE",
+                            reason=(
+                                "plugin contract translation already equals the "
+                                "validated current source value"
+                            ),
+                        )
+                    )
+                else:
+                    validated.append(plan)
         validated = _block_plugin_edit_overlaps(validated, report)
         _set_plugin_contract_report_metadata(
             report,
@@ -1185,11 +1201,16 @@ def _set_plugin_contract_report_metadata(
         not in {"PLUGIN_CONTRACT_UNSUPPORTED", "PLUGIN_EDIT_OVERLAP"}
         for issue in plugin_errors
     )
+    no_change = sum(
+        issue.id in plugin_ids and issue.code == "NO_CHANGE"
+        for issue in report.issues
+    )
     report.extra_metadata["plugin_contracts"] = {
         "total_entries": len(plugin_records),
         "supported_entries": supported,
         "unsupported_entries": unsupported,
         "applicable_entries": len(plugin_plans),
+        "no_change_entries": no_change,
         "precondition_failures": precondition_failures,
         "overlap_conflicts": overlap_conflicts,
         "contract_type_totals": dict(sorted(contract_totals.items())),

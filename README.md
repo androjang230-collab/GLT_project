@@ -1,11 +1,14 @@
 # Game Localization Toolkit (GLT)
 
 Windows 11에서 일본 동인게임의 번역 가능한 문자열을 안전하게 다루기 위한
-개인용 Python 도구입니다. 현재 버전은 **GLT 0.8.5**이며 RPG Maker MV/MZ의
+개인용 Python 도구입니다. 현재 버전은 **GLT 0.9.0**이며 RPG Maker MV/MZ의
 엔진 감지, UTF-8 JSONL 추출, 별도 폴더 안전 적용, 독립 QA, dry-run,
 fingerprint와 이식 가능한 번역 Project, 사용자 Glossary 및 JSONL Translation
 Memory, 폰트 진단과 안전한 기본 폰트 패치를 구현합니다. 대용량 번역 JSONL은
 독립 Split/Merge 유틸리티로 나누고 무결성을 검증하며 다시 합칠 수 있습니다.
+RPG Maker의 활성 plugin registry와 JavaScript를 실행하지 않는 bounded static
+analysis로 조사하여, 검증된 plugin parameter와 note block text를 같은 안전한
+extract/QA/apply 흐름에 연결합니다.
 WOLF RPG Editor는 자동 감지, archive 조사, 공식 `.Auto.txt`의 구조 분석·추출·QA·
 안전 적용과 격리된 official Editor Text I/O validation을 지원합니다.
 
@@ -13,7 +16,7 @@ WOLF RPG Editor는 자동 감지, archive 조사, 공식 `.Auto.txt`의 구조 �
 
 | Engine | Detect | Inspect | Extract | QA / Apply | Font |
 | --- | --- | --- | --- | --- | --- |
-| RPG Maker MV/MZ | Yes | Not yet | Yes | Yes | Yes |
+| RPG Maker MV/MZ | Yes | Yes | Yes | Yes | Yes |
 | WOLF RPG Editor | Experimental | Yes (`.Auto.txt`) | Yes (`.Auto.txt`) | Yes (`.Auto.txt`) | Not yet |
 
 WOLF native archive 해제·복호화·binary 직접 수정은 수행하지 않습니다. 공식 Editor
@@ -186,9 +189,47 @@ DB 파일은 다음 필드만 명시적으로 처리합니다.
 - `MapXXX.json`: `displayName`과 지원 이벤트 명령
 - `CommonEvents.json`, `Troops.json`: 지원 이벤트 명령
 
-이미지·오디오 이름, `note`, JavaScript/스크립트 명령, 플러그인 명령,
-이벤트 내부 이름, 공통 이벤트/전투 그룹 내부 이름, System의 `switches`와
-`variables`는 추출하지 않습니다.
+표준 필드 규칙은 이미지·오디오 이름, `note`, JavaScript/스크립트 명령,
+플러그인 명령, 이벤트 내부 이름, 공통 이벤트/전투 그룹 내부 이름, System의
+`switches`와 `variables`를 추출하지 않습니다. 별도로 검증된 plugin command와
+아래 contract만 명시적인 예외입니다.
+
+## 0.9.0 RPG Maker plugin-visible text
+
+0.9.0은 활성 plugin inventory를 `js/plugins.js`의 load order와 연결하고,
+plugin JavaScript를 실행하지 않는 bounded static analysis로
+source → transform → sink 근거를 수집합니다. 표시 효과가 있다는 사실만으로
+번역 문자열로 취급하지 않으며 다음 semantic role을 명시적으로 구분합니다.
+
+- `TRANSLATABLE_TEXT`: 정확한 저장 위치와 표시용 text 흐름이 검증됨
+- `VISIBLE_FORMATTING`: font size, 색상, 좌표, 간격 등 표시 형식 값
+- `INTERNAL_CONTROL`: ID, switch, boolean, filename 및 제어 keyword
+- `MIXED_USE`: 표시와 논리 token으로 함께 사용됨
+- `UNSAFE_TEXT`: 실행 가능한 구문 또는 안전하지 않은 흐름에 도달함
+- `UNKNOWN`: source, transform, sink 또는 저장 경계를 확정할 수 없음
+
+0.9.0의 완전한 round-trip contract는 다음 두 가지입니다.
+
+- `scalar_parameter_text`: `plugins.js`의 검증된 scalar parameter string token
+- `delimited_block_text`: data JSON note에서 검증된 delimiter 사이의 body
+
+`regex_capture_text`, `meta_value_text`, `tokenized_visible_segment`는 contract
+모델에 존재할 수 있지만 0.9.0 apply 대상이 아닙니다. Apply는 현재 게임을 다시
+분석하여 storage identity, original, contract/source/grammar fingerprint와 span을
+검증합니다. `plugins.js`는 전체 재직렬화 없이 정확한 string token만 patch하고,
+note는 delimiter와 주변 내용을 유지한 채 body만 재구성합니다. 겹치는 edit는
+차단하며 staging copy, structural comparison 및 atomic write를 계속 사용합니다.
+이미 같은 값인 plugin contract 번역은 `NO_CHANGE`로 보고하고 write plan에서
+제외합니다. JSONL 및 artifact schema는 계속 version 1입니다.
+
+분석기는 JavaScript, `eval`, `Function()` 또는 외부 JS engine을 실행하지 않습니다.
+기본적으로 활성 plugin만 분석하며 false positive보다 누락을 우선합니다. Dynamic
+meta property, 지연된 object-property rendering, JSON-in-string parameter,
+computed `PluginManager.parameters` argument, 복잡한 callback/closure, 임의 object
+state propagation 및 obfuscated/minified source는 audit-only 또는 `UNKNOWN`으로
+남을 수 있습니다. 상세 구조와 검증 결과는
+[RPG Maker plugin-visible contracts](docs/rpgmaker_plugin_visibility_0.9.0.md)에
+정리되어 있습니다.
 
 ## JSONL 형식
 
@@ -1019,3 +1060,12 @@ callback, recursion, eval은 계속 UNKNOWN/UNSAFE로 유지합니다.
 `joined_optional_numeric_tail`은 공백으로 재구성한 text 뒤의 명시적 숫자 option을
 원문에 보존합니다. runtime 제어코드 때문에 숫자 여부가 불명확하면 추출하지
 않습니다. 기존 ID, schema version 1과 `mv_info_display` 규칙은 변경하지 않습니다.
+
+## 0.9.0 RPG Maker plugin-visible contracts
+
+활성 plugin inventory와 bounded source → transform → sink 분석, semantic-role
+분리, 정확한 storage binding을 추가했습니다. 검증된 scalar plugin parameter와
+delimited note block은 JSONL extraction과 안전한 contract-aware apply를 지원합니다.
+실게임에서 66개 항목의 dry-run과 선택 항목 round-trip을 수행해 ID/storage identity,
+plugin registry 표현 및 note 의미 구조 보존을 확인했습니다. Schema version 1과
+기존 RPG Maker/WOLF 동작은 유지됩니다.

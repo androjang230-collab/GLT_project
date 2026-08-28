@@ -349,7 +349,7 @@ PluginManager.registerCommand('AuditPlugin', 'addLog', args => {});
                 "--csv", str(csv_path),
             ])
         self.assertEqual(0, code)
-        self.assertEqual("0.8.5", json.loads(report_path.read_text(encoding="utf-8"))["tool_version"])
+        self.assertEqual("0.9.0", json.loads(report_path.read_text(encoding="utf-8"))["tool_version"])
         self.assertTrue(csv_path.read_text(encoding="utf-8-sig").startswith("file,json_path,"))
 
     def test_cli_accepts_external_read_only_plugin_evidence(self) -> None:
