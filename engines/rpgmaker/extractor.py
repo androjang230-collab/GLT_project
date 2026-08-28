@@ -23,8 +23,14 @@ from engines.rpgmaker.plugin_rules import (
 )
 from engines.rpgmaker.mv_plugin_discovery import (
     MvPluginDiscovery,
+    MvPluginDiscoveryReport,
     discover_mv_plugin_commands,
 )
+from engines.rpgmaker.plugin_contracts import (
+    PluginContractReport,
+    extract_plugin_consumed_text,
+)
+from engines.rpgmaker.plugin_inventory import PluginInventory, load_plugin_inventory
 
 
 _MAP_FILE_PATTERN = re.compile(r"Map(\d+)\.json", re.IGNORECASE)
@@ -113,6 +119,7 @@ class RpgMakerExtractor:
             raise ValueError(f"unsupported engine: {engine}")
         self.engine = engine
         self._mv_runtime_rules: dict[str, MvPluginDiscovery] = {}
+        self.plugin_contract_report = PluginContractReport()
 
     def extract(self, game_directory: Path) -> ExtractionResult:
         data_directory = game_directory / "data"
@@ -124,19 +131,31 @@ class RpgMakerExtractor:
             return result
 
         self._mv_runtime_rules = {}
-        if self.engine == EngineId.RPGMAKER_MV:
-            config = game_directory / "js/plugins.js"
-            sources = game_directory / "js/plugins"
-            if config.is_file() and sources.is_dir():
-                try:
-                    discovery = discover_mv_plugin_commands(config, sources)
-                    self._mv_runtime_rules = {
-                        item.command: item
-                        for item in discovery.observations
-                        if item.classification == "APPLY_VERIFIED"
-                    }
-                except (OSError, UnicodeError, ValueError):
-                    self._mv_runtime_rules = {}
+        self.plugin_contract_report = PluginContractReport()
+        config = game_directory / "js/plugins.js"
+        sources = game_directory / "js/plugins"
+        inventory: PluginInventory | None = None
+        discovery: MvPluginDiscoveryReport | None = None
+        if config.is_file() and sources.is_dir():
+            try:
+                inventory = load_plugin_inventory(config, sources)
+            except (OSError, UnicodeError, ValueError):
+                inventory = None
+        if self.engine == EngineId.RPGMAKER_MV and inventory is not None:
+            try:
+                discovery = discover_mv_plugin_commands(
+                    config,
+                    sources,
+                    inventory=inventory,
+                )
+                self._mv_runtime_rules = {
+                    item.command: item
+                    for item in discovery.observations
+                    if item.classification == "APPLY_VERIFIED"
+                }
+            except (OSError, UnicodeError, ValueError):
+                discovery = None
+                self._mv_runtime_rules = {}
 
         map_names = self._load_map_names(data_directory, result)
 
@@ -185,6 +204,36 @@ class RpgMakerExtractor:
                     continue
                 seen_ids[entry.id] = relative_file
                 result.entries.append(entry)
+
+        self.plugin_contract_report = extract_plugin_consumed_text(
+            game_directory,
+            self.engine,
+            existing_entries=result.entries,
+            inventory=inventory,
+            command_discovery=discovery,
+        )
+        result.issues.extend(self.plugin_contract_report.issues)
+        for suppression in self.plugin_contract_report.suppressions:
+            if suppression.code != "PLUGIN_CONTRACT_OVERLAP":
+                continue
+            result.issues.append(
+                ExtractionIssue(
+                    suppression.file or "plugin_consumed_text",
+                    f"{suppression.code}: {suppression.reason}",
+                )
+            )
+        for entry in self.plugin_contract_report.entries:
+            first_file = seen_ids.get(entry.id)
+            if first_file is not None:
+                result.issues.append(
+                    ExtractionIssue(
+                        entry.file,
+                        f"duplicate translation ID {entry.id!r}; first seen in {first_file}",
+                    )
+                )
+                continue
+            seen_ids[entry.id] = entry.file
+            result.entries.append(entry)
         return result
 
     @classmethod
