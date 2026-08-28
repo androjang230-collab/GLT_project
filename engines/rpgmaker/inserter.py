@@ -13,7 +13,7 @@ import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Mapping, TypeAlias
 
 from core.errors import ApplySafetyError
 from core.models import (
@@ -30,6 +30,12 @@ from engines.rpgmaker.plugin_rules import (
     extract_runtime_payload,
     parse_editor_annotation,
     rebuild_editor_annotation,
+)
+from engines.rpgmaker.plugin_contracts import (
+    ContractType,
+    SemanticRole,
+    resolve_delimited_block_spans,
+    resolve_plugin_parameter_binding,
 )
 from engines.rpgmaker.validator import (
     JapaneseAllowlist,
@@ -58,6 +64,7 @@ class TranslationRecord:
     command_index: int | None
     parameter_index: int | None
     line_number: int
+    extra_metadata: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +75,33 @@ class _ValidatedRecord:
     expected_storage_value: str
     replacement_value: str
     mirror_updates: tuple["_MirrorUpdate", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _PluginValidatedRecord:
+    record: TranslationRecord
+    canonical: TranslationEntry
+    contract_type: str
+    storage_identity: str
+    span_start: int
+    span_end: int
+    expected_segment: str
+    replacement_segment: str
+    expected_storage_value: str
+    path_tokens: tuple[JsonPathToken, ...] = ()
+
+    @property
+    def overlap_unit(self) -> tuple[str, ...]:
+        if self.contract_type == "scalar_parameter_text":
+            return ("raw_file", self.canonical.file)
+        return (
+            "json_field",
+            self.canonical.file,
+            self.canonical.json_path or "",
+        )
+
+
+_ApplyPlan: TypeAlias = _ValidatedRecord | _PluginValidatedRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +118,7 @@ class PreflightResult:
 
     report: ApplyReport
     records: list[TranslationRecord]
-    validated_records: list[_ValidatedRecord]
+    validated_records: list[_ApplyPlan]
 
 
 class RpgMakerInserter:
@@ -294,7 +328,7 @@ class RpgMakerInserter:
         duplicate_ids: set[str],
         report: ApplyReport,
         allowlist: JapaneseAllowlist | None,
-    ) -> list[_ValidatedRecord]:
+    ) -> list[_ApplyPlan]:
         extraction = RpgMakerExtractor(self.engine).extract(game_directory)
         for issue in extraction.issues:
             report.issues.append(
@@ -308,7 +342,7 @@ class RpgMakerInserter:
         canonical_by_id = {entry.id: entry for entry in extraction.entries}
         documents: dict[str, Any] = {}
 
-        validated: list[_ValidatedRecord] = []
+        validated: list[_ApplyPlan] = []
         for record in records:
             if record.id in duplicate_ids:
                 continue
@@ -324,38 +358,54 @@ class RpgMakerInserter:
                     )
                 )
                 continue
-            if not _is_safe_data_path(record.file):
+            is_plugin_claim = (
+                record.id.startswith("PluginConsumed:")
+                or record.extra_metadata.get("source_kind")
+                == "plugin_consumed_text"
+            )
+            if not _is_safe_translation_path(record.file):
                 report.issues.append(
                     _record_issue(
                         record,
                         severity="error",
                         code="INVALID_FILE_PATH",
-                        reason="file must be a relative path below data/",
+                        reason=(
+                            "file must be a relative data/*.json path or the exact "
+                            "Phase-2B target js/plugins.js"
+                        ),
                     )
                 )
                 continue
-            try:
-                path_tokens = parse_json_path(record.json_path)
-            except JsonPathError as exc:
-                report.issues.append(
-                    _record_issue(
-                        record,
-                        severity="error",
-                        code="INVALID_JSON_PATH",
-                        reason=str(exc),
+            path_tokens: tuple[JsonPathToken, ...] = ()
+            if record.file != "js/plugins.js":
+                try:
+                    path_tokens = parse_json_path(record.json_path)
+                except JsonPathError as exc:
+                    report.issues.append(
+                        _record_issue(
+                            record,
+                            severity="error",
+                            code="INVALID_JSON_PATH",
+                            reason=str(exc),
+                        )
                     )
-                )
-                continue
+                    continue
 
             canonical = canonical_by_id.get(record.id)
             if canonical is None:
                 target = game_directory.joinpath(*PurePosixPath(record.file).parts)
-                code = "UNKNOWN_ID" if target.is_file() else "TARGET_FILE_NOT_FOUND"
-                reason = (
-                    "ID does not identify a Phase 2 translation target"
-                    if target.is_file()
-                    else "target JSON file does not exist"
-                )
+                if is_plugin_claim and target.is_file():
+                    code = "PLUGIN_CONTRACT_NOT_RESOLVED"
+                    reason = (
+                        "plugin contract no longer resolves uniquely in the current source"
+                    )
+                else:
+                    code = "UNKNOWN_ID" if target.is_file() else "TARGET_FILE_NOT_FOUND"
+                    reason = (
+                        "ID does not identify a Phase 2 translation target"
+                        if target.is_file()
+                        else "target source file does not exist"
+                    )
                 report.issues.append(
                     _record_issue(
                         record,
@@ -504,26 +554,49 @@ class RpgMakerInserter:
                         ),
                     )
                 )
-            plan = _build_storage_plan(
-                game_directory,
-                record,
-                canonical,
-                path_tokens,
-                documents,
-                report,
-            )
+            if canonical.extra_metadata.get("source_kind") == "plugin_consumed_text":
+                plan = _build_plugin_storage_plan(
+                    game_directory,
+                    record,
+                    canonical,
+                    path_tokens,
+                    documents,
+                    report,
+                )
+            else:
+                plan = _build_storage_plan(
+                    game_directory,
+                    record,
+                    canonical,
+                    path_tokens,
+                    documents,
+                    report,
+                )
             if plan is not None:
                 validated.append(plan)
+        validated = _block_plugin_edit_overlaps(validated, report)
+        _set_plugin_contract_report_metadata(
+            report,
+            records,
+            validated,
+            canonical_by_id,
+        )
         return validated
 
     @staticmethod
     def _apply_validated_records(
         staging_directory: Path,
-        records: list[_ValidatedRecord],
+        records: list[_ApplyPlan],
         report: ApplyReport,
     ) -> None:
+        standard_records = [
+            item for item in records if isinstance(item, _ValidatedRecord)
+        ]
+        plugin_records = [
+            item for item in records if isinstance(item, _PluginValidatedRecord)
+        ]
         grouped: dict[str, list[_ValidatedRecord]] = defaultdict(list)
-        for validated in records:
+        for validated in standard_records:
             grouped[validated.canonical.file].append(validated)
 
         for relative_file, file_records in grouped.items():
@@ -653,8 +726,11 @@ class RpgMakerInserter:
                         )
                     )
                 continue
-            report.modified_files.append(relative_file)
+            if relative_file not in report.modified_files:
+                report.modified_files.append(relative_file)
             report.applied += len(applied_records)
+
+        _apply_plugin_validated_records(staging_directory, plugin_records, report)
 
     @staticmethod
     def _verify_unchanged_files(
@@ -706,6 +782,663 @@ class RpgMakerInserter:
 _MZ_COMMAND_PATH = re.compile(
     r"^(?P<list_path>\$[\s\S]*\.list)\[(?P<index>\d+)\]\.parameters\[3\][\s\S]*$"
 )
+_PLUGIN_PARAMETER_PATH = re.compile(r"^\$\[(?P<load_order>\d+)\]\.parameters$")
+_SUPPORTED_PLUGIN_CONTRACT_TYPES = frozenset(
+    {
+        ContractType.SCALAR_PARAMETER_TEXT.value,
+        ContractType.DELIMITED_BLOCK_TEXT.value,
+    }
+)
+_PLUGIN_METADATA_PRECONDITIONS = (
+    "source_kind",
+    "semantic_role",
+    "contract_type",
+    "contract_id",
+    "contract_fingerprint",
+    "storage_file",
+    "storage_type",
+    "storage_identity",
+    "storage_key",
+    "parser_evidence",
+    "sink_evidence",
+    "segment_ordinal",
+    "segment_start",
+    "segment_end",
+    "source_fingerprint",
+    "grammar_fingerprint",
+    "whitespace_policy",
+    "apply_supported",
+)
+
+
+def _build_plugin_storage_plan(
+    game_directory: Path,
+    record: TranslationRecord,
+    canonical: TranslationEntry,
+    path_tokens: tuple[JsonPathToken, ...],
+    documents: dict[str, Any],
+    report: ApplyReport,
+) -> _PluginValidatedRecord | None:
+    """Re-resolve a Phase-2B contract against authoritative current source."""
+
+    metadata = canonical.extra_metadata
+    contract_type = metadata.get("contract_type")
+    if (
+        contract_type not in _SUPPORTED_PLUGIN_CONTRACT_TYPES
+        or metadata.get("apply_supported") is not True
+    ):
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="PLUGIN_CONTRACT_UNSUPPORTED",
+                reason=(
+                    f"contract type {contract_type!r} has no Phase-2B apply path"
+                ),
+            )
+        )
+        return None
+    missing = [
+        key for key in _PLUGIN_METADATA_PRECONDITIONS if key not in record.extra_metadata
+    ]
+    if contract_type == ContractType.SCALAR_PARAMETER_TEXT.value:
+        missing.extend(
+            key
+            for key in ("source_token_start", "source_token_end")
+            if key not in record.extra_metadata
+        )
+    if missing:
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="PLUGIN_CONTRACT_METADATA_MISSING",
+                reason=f"required contract metadata is missing: {sorted(set(missing))!r}",
+            )
+        )
+        return None
+    if record.extra_metadata.get("apply_supported") is not True:
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="PLUGIN_CONTRACT_UNSUPPORTED",
+                reason="translation artifact does not declare this contract apply-supported",
+            )
+        )
+        return None
+    for key in _PLUGIN_METADATA_PRECONDITIONS:
+        if record.extra_metadata.get(key) == metadata.get(key):
+            continue
+        code = (
+            "PLUGIN_SOURCE_FINGERPRINT_MISMATCH"
+            if key == "source_fingerprint"
+            else "PLUGIN_GRAMMAR_FINGERPRINT_MISMATCH"
+            if key in {"contract_fingerprint", "grammar_fingerprint"}
+            else "PLUGIN_STORAGE_IDENTITY_MISMATCH"
+            if key.startswith("storage_") or key.startswith("segment_")
+            else "PLUGIN_CONTRACT_METADATA_MISMATCH"
+        )
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="conflict",
+                code=code,
+                reason=f"current contract metadata differs for {key!r}",
+            )
+        )
+        return None
+
+    if contract_type == ContractType.SCALAR_PARAMETER_TEXT.value:
+        return _build_scalar_parameter_plan(
+            game_directory, record, canonical, report
+        )
+    return _build_delimited_block_plan(
+        game_directory,
+        record,
+        canonical,
+        path_tokens,
+        documents,
+        report,
+    )
+
+
+def _build_scalar_parameter_plan(
+    game_directory: Path,
+    record: TranslationRecord,
+    canonical: TranslationEntry,
+    report: ApplyReport,
+) -> _PluginValidatedRecord | None:
+    metadata = canonical.extra_metadata
+    path_match = _PLUGIN_PARAMETER_PATH.fullmatch(canonical.json_path or "")
+    key = metadata.get("storage_key")
+    if (
+        canonical.file != "js/plugins.js"
+        or metadata.get("storage_type") != "plugins_js_parameter_string"
+        or path_match is None
+        or not isinstance(key, str)
+    ):
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="PLUGIN_STORAGE_IDENTITY_MISMATCH",
+                reason="scalar parameter is not bound to an exact plugins.js token",
+            )
+        )
+        return None
+    source = game_directory / "js/plugins.js"
+    resolved = resolve_plugin_parameter_binding(
+        source,
+        int(path_match.group("load_order")),
+        key,
+    )
+    if resolved is None:
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="conflict",
+                code="PLUGIN_CONTRACT_NOT_RESOLVED",
+                reason="current plugins.js no longer resolves the verified plugin/key token",
+            )
+        )
+        return None
+    value, binding = resolved
+    if (
+        value != record.original
+        or binding.storage_identity != metadata.get("storage_identity")
+        or binding.source_value_sha256 != metadata.get("source_fingerprint")
+        or record.extra_metadata.get("source_token_start")
+        != metadata.get("source_token_start")
+        or record.extra_metadata.get("source_token_end")
+        != metadata.get("source_token_end")
+        or binding.token_start != metadata.get("source_token_start")
+        or binding.token_end != metadata.get("source_token_end")
+    ):
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="conflict",
+                code="PLUGIN_SOURCE_PRECONDITION_FAILED",
+                reason="current scalar token identity, fingerprint, span, or value changed",
+            )
+        )
+        return None
+    try:
+        source_text = source.read_bytes().decode("utf-8-sig")
+        token = source_text[binding.token_start : binding.token_end]
+        decoded = json.loads(token)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="PLUGIN_SOURCE_PRECONDITION_FAILED",
+                reason=f"verified scalar token cannot be decoded: {exc}",
+            )
+        )
+        return None
+    if decoded != record.original:
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="conflict",
+                code="SOURCE_TEXT_MISMATCH",
+                reason="current plugins.js token differs from JSONL original",
+            )
+        )
+        return None
+    return _PluginValidatedRecord(
+        record=record,
+        canonical=canonical,
+        contract_type=ContractType.SCALAR_PARAMETER_TEXT.value,
+        storage_identity=binding.storage_identity,
+        span_start=binding.token_start,
+        span_end=binding.token_end,
+        expected_segment=token,
+        replacement_segment=_encode_js_string(record.translation),
+        expected_storage_value=source_text,
+    )
+
+
+def _build_delimited_block_plan(
+    game_directory: Path,
+    record: TranslationRecord,
+    canonical: TranslationEntry,
+    path_tokens: tuple[JsonPathToken, ...],
+    documents: dict[str, Any],
+    report: ApplyReport,
+) -> _PluginValidatedRecord | None:
+    metadata = canonical.extra_metadata
+    if (
+        not _is_safe_data_path(canonical.file)
+        or metadata.get("storage_type") != "data_json_note_field"
+        or not path_tokens
+    ):
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="PLUGIN_STORAGE_IDENTITY_MISMATCH",
+                reason="delimited block is not bound to an exact data JSON note field",
+            )
+        )
+        return None
+    document = documents.get(record.file)
+    if document is None:
+        source = game_directory.joinpath(*PurePosixPath(record.file).parts)
+        try:
+            document = json.loads(source.read_bytes().decode("utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            report.issues.append(
+                _record_issue(
+                    record,
+                    severity="error",
+                    code="MALFORMED_SOURCE_JSON",
+                    reason=str(exc),
+                )
+            )
+            return None
+        documents[record.file] = document
+    try:
+        note = get_json_value(document, path_tokens)
+    except JsonPathError as exc:
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="INVALID_JSON_PATH",
+                reason=str(exc),
+            )
+        )
+        return None
+    if not isinstance(note, str):
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="error",
+                code="INVALID_TARGET_TYPE",
+                reason="plugin note target is not a string",
+            )
+        )
+        return None
+    parser_rule = metadata.get("parser_evidence")
+    ordinal = metadata.get("segment_ordinal")
+    start = metadata.get("segment_start")
+    end = metadata.get("segment_end")
+    spans = (
+        resolve_delimited_block_spans(note, parser_rule)
+        if isinstance(parser_rule, str)
+        else ()
+    )
+    if (
+        not isinstance(ordinal, int)
+        or isinstance(ordinal, bool)
+        or not isinstance(start, int)
+        or isinstance(start, bool)
+        or not isinstance(end, int)
+        or isinstance(end, bool)
+        or not 0 <= ordinal < len(spans)
+        or spans[ordinal] != (start, end)
+        or note[start:end] != record.original
+        or _sha256_text(note) != metadata.get("source_fingerprint")
+    ):
+        report.issues.append(
+            _record_issue(
+                record,
+                severity="conflict",
+                code="PLUGIN_SOURCE_PRECONDITION_FAILED",
+                reason=(
+                    "current note grammar, block ordinal, source fingerprint, "
+                    "span, or body changed"
+                ),
+            )
+        )
+        return None
+    return _PluginValidatedRecord(
+        record=record,
+        canonical=canonical,
+        contract_type=ContractType.DELIMITED_BLOCK_TEXT.value,
+        storage_identity=str(metadata["storage_identity"]),
+        span_start=start,
+        span_end=end,
+        expected_segment=record.original,
+        replacement_segment=record.translation,
+        expected_storage_value=note,
+        path_tokens=path_tokens,
+    )
+
+
+def _block_plugin_edit_overlaps(
+    plans: list[_ApplyPlan],
+    report: ApplyReport,
+) -> list[_ApplyPlan]:
+    plugin_plans = [
+        item for item in plans if isinstance(item, _PluginValidatedRecord)
+    ]
+    grouped: dict[tuple[str, ...], list[_PluginValidatedRecord]] = defaultdict(list)
+    for item in plugin_plans:
+        grouped[item.overlap_unit].append(item)
+    blocked_ids: set[str] = set()
+    for items in grouped.values():
+        ordered = sorted(items, key=lambda item: (item.span_start, item.span_end))
+        for index, left in enumerate(ordered):
+            for right in ordered[index + 1 :]:
+                if right.span_start >= left.span_end:
+                    break
+                if max(left.span_start, right.span_start) < min(
+                    left.span_end, right.span_end
+                ):
+                    blocked_ids.update({left.record.id, right.record.id})
+    for item in plugin_plans:
+        if item.record.id not in blocked_ids:
+            continue
+        report.issues.append(
+            _record_issue(
+                item.record,
+                severity="conflict",
+                code="PLUGIN_EDIT_OVERLAP",
+                reason="planned plugin edits overlap in the same storage unit",
+            )
+        )
+    return [item for item in plans if item.record.id not in blocked_ids]
+
+
+def _set_plugin_contract_report_metadata(
+    report: ApplyReport,
+    records: list[TranslationRecord],
+    validated: list[_ApplyPlan],
+    canonical_by_id: Mapping[str, TranslationEntry],
+) -> None:
+    plugin_records = [
+        item
+        for item in records
+        if item.id.startswith("PluginConsumed:")
+        or item.extra_metadata.get("source_kind") == "plugin_consumed_text"
+    ]
+    contract_totals = Counter(
+        str(item.extra_metadata.get("contract_type", "UNKNOWN"))
+        for item in plugin_records
+    )
+    supported = sum(
+        item.extra_metadata.get("contract_type")
+        in _SUPPORTED_PLUGIN_CONTRACT_TYPES
+        for item in plugin_records
+    )
+    plugin_plans = [
+        item for item in validated if isinstance(item, _PluginValidatedRecord)
+    ]
+    plugin_ids = {item.id for item in plugin_records}
+    plugin_errors = [
+        issue
+        for issue in report.issues
+        if issue.id in plugin_ids and issue.severity in {"error", "conflict"}
+    ]
+    unsupported = sum(
+        issue.code == "PLUGIN_CONTRACT_UNSUPPORTED" for issue in plugin_errors
+    )
+    overlap_conflicts = sum(
+        issue.code == "PLUGIN_EDIT_OVERLAP" for issue in plugin_errors
+    )
+    precondition_failures = sum(
+        issue.code
+        not in {"PLUGIN_CONTRACT_UNSUPPORTED", "PLUGIN_EDIT_OVERLAP"}
+        for issue in plugin_errors
+    )
+    report.extra_metadata["plugin_contracts"] = {
+        "total_entries": len(plugin_records),
+        "supported_entries": supported,
+        "unsupported_entries": unsupported,
+        "applicable_entries": len(plugin_plans),
+        "precondition_failures": precondition_failures,
+        "overlap_conflicts": overlap_conflicts,
+        "contract_type_totals": dict(sorted(contract_totals.items())),
+        "planned_files": sorted({item.canonical.file for item in plugin_plans}),
+        "resolved_current_entries": sum(
+            item.id in canonical_by_id for item in plugin_records
+        ),
+    }
+
+
+def _encode_js_string(value: str) -> str:
+    return (
+        json.dumps(value, ensure_ascii=False)
+        .replace("\u2028", r"\u2028")
+        .replace("\u2029", r"\u2029")
+    )
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _apply_plugin_validated_records(
+    staging_directory: Path,
+    records: list[_PluginValidatedRecord],
+    report: ApplyReport,
+) -> None:
+    scalar_records = [
+        item
+        for item in records
+        if item.contract_type == ContractType.SCALAR_PARAMETER_TEXT.value
+    ]
+    note_records = [
+        item
+        for item in records
+        if item.contract_type == ContractType.DELIMITED_BLOCK_TEXT.value
+    ]
+    if scalar_records:
+        _apply_scalar_parameter_records(
+            staging_directory,
+            scalar_records,
+            report,
+        )
+    if note_records:
+        _apply_delimited_block_records(
+            staging_directory,
+            note_records,
+            report,
+        )
+
+
+def _apply_scalar_parameter_records(
+    staging_directory: Path,
+    records: list[_PluginValidatedRecord],
+    report: ApplyReport,
+) -> None:
+    grouped: dict[str, list[_PluginValidatedRecord]] = defaultdict(list)
+    for item in records:
+        grouped[item.canonical.file].append(item)
+    for relative_file, file_records in grouped.items():
+        target = staging_directory.joinpath(*PurePosixPath(relative_file).parts)
+        try:
+            original_bytes = target.read_bytes()
+            source_text = original_bytes.decode("utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            for item in file_records:
+                report.issues.append(
+                    _record_issue(
+                        item.record,
+                        severity="error",
+                        code="PLUGIN_SOURCE_PRECONDITION_FAILED",
+                        reason=f"copied plugins.js cannot be read: {exc}",
+                    )
+                )
+            continue
+        invalid = [
+            item
+            for item in file_records
+            if source_text != item.expected_storage_value
+            or source_text[item.span_start : item.span_end] != item.expected_segment
+        ]
+        if invalid:
+            for item in file_records:
+                report.issues.append(
+                    _record_issue(
+                        item.record,
+                        severity="conflict",
+                        code="PLUGIN_SOURCE_PRECONDITION_FAILED",
+                        reason=(
+                            "copied plugins.js changed after preflight; the file was not patched"
+                        ),
+                    )
+                )
+            continue
+        patched = source_text
+        for item in sorted(
+            file_records,
+            key=lambda value: (value.span_start, value.span_end),
+            reverse=True,
+        ):
+            patched = (
+                patched[: item.span_start]
+                + item.replacement_segment
+                + patched[item.span_end :]
+            )
+        encoding = "utf-8-sig" if original_bytes.startswith(b"\xef\xbb\xbf") else "utf-8"
+        write_error = _write_plugins_js_atomic_verified(
+            target,
+            patched.encode(encoding),
+            file_records,
+        )
+        if write_error is not None:
+            for item in file_records:
+                report.issues.append(
+                    _record_issue(
+                        item.record,
+                        severity="error",
+                        code="PLUGIN_WRITE_VALIDATION_FAILED",
+                        reason=write_error,
+                    )
+                )
+            continue
+        if relative_file not in report.modified_files:
+            report.modified_files.append(relative_file)
+        report.applied += len(file_records)
+
+
+def _apply_delimited_block_records(
+    staging_directory: Path,
+    records: list[_PluginValidatedRecord],
+    report: ApplyReport,
+) -> None:
+    grouped: dict[str, list[_PluginValidatedRecord]] = defaultdict(list)
+    for item in records:
+        grouped[item.canonical.file].append(item)
+    for relative_file, file_records in grouped.items():
+        target = staging_directory.joinpath(*PurePosixPath(relative_file).parts)
+        try:
+            raw_bytes = target.read_bytes()
+            document = json.loads(raw_bytes.decode("utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            for item in file_records:
+                report.issues.append(
+                    _record_issue(
+                        item.record,
+                        severity="error",
+                        code="MALFORMED_SOURCE_JSON",
+                        reason=str(exc),
+                    )
+                )
+            continue
+
+        before = copy.deepcopy(document)
+        by_field: dict[str, list[_PluginValidatedRecord]] = defaultdict(list)
+        for item in file_records:
+            by_field[item.canonical.json_path or ""].append(item)
+        allowed_paths: set[str] = set()
+        applied_records: list[_PluginValidatedRecord] = []
+        for json_path, field_records in by_field.items():
+            first = field_records[0]
+            try:
+                current = get_json_value(document, first.path_tokens)
+            except JsonPathError as exc:
+                for item in field_records:
+                    report.issues.append(
+                        _record_issue(
+                            item.record,
+                            severity="error",
+                            code="INVALID_JSON_PATH",
+                            reason=str(exc),
+                        )
+                    )
+                continue
+            parser_rule = first.canonical.extra_metadata.get("parser_evidence")
+            current_spans = (
+                resolve_delimited_block_spans(current, parser_rule)
+                if isinstance(current, str) and isinstance(parser_rule, str)
+                else ()
+            )
+            invalid = not isinstance(current, str) or any(
+                current != item.expected_storage_value
+                or current[item.span_start : item.span_end] != item.expected_segment
+                or (item.span_start, item.span_end) not in current_spans
+                for item in field_records
+            )
+            if invalid:
+                for item in field_records:
+                    report.issues.append(
+                        _record_issue(
+                            item.record,
+                            severity="conflict",
+                            code="PLUGIN_SOURCE_PRECONDITION_FAILED",
+                            reason=(
+                                "copied note grammar or body changed after preflight; "
+                                "the note field was not patched"
+                            ),
+                        )
+                    )
+                continue
+            patched = current
+            for item in sorted(
+                field_records,
+                key=lambda value: (value.span_start, value.span_end),
+                reverse=True,
+            ):
+                patched = (
+                    patched[: item.span_start]
+                    + item.replacement_segment
+                    + patched[item.span_end :]
+                )
+            set_json_value(document, first.path_tokens, patched)
+            allowed_paths.add(json_path)
+            applied_records.extend(field_records)
+
+        if not applied_records:
+            continue
+        unexpected = find_unexpected_changes(before, document, allowed_paths)
+        if unexpected:
+            for item in applied_records:
+                report.issues.append(
+                    _record_issue(
+                        item.record,
+                        severity="error",
+                        code="UNEXPECTED_DATA_CHANGE",
+                        reason=f"unexpected changed paths: {unexpected!r}",
+                    )
+                )
+            continue
+        write_error = _write_json_atomic_verified(
+            target,
+            raw_bytes,
+            document,
+            before,
+            allowed_paths,
+        )
+        if write_error is not None:
+            for item in applied_records:
+                report.issues.append(
+                    _record_issue(
+                        item.record,
+                        severity="error",
+                        code="UNEXPECTED_DATA_CHANGE",
+                        reason=write_error,
+                    )
+                )
+            continue
+        if relative_file not in report.modified_files:
+            report.modified_files.append(relative_file)
+        report.applied += len(applied_records)
 
 
 def _build_storage_plan(
@@ -1006,6 +1739,23 @@ def _parse_translation_record(
             )
             return None
         location_metadata[field_name] = value
+    standard_fields = {
+        "id",
+        "engine",
+        "file",
+        "type",
+        "original",
+        "translation",
+        "speaker",
+        "json_path",
+        "event_id",
+        "page_id",
+        "command_index",
+        "parameter_index",
+        "map_id",
+        "map_name",
+        "control_codes",
+    }
     return TranslationRecord(
         id=entry_id,
         engine=payload["engine"],
@@ -1020,6 +1770,9 @@ def _parse_translation_record(
         command_index=location_metadata["command_index"],
         parameter_index=location_metadata["parameter_index"],
         line_number=line_number,
+        extra_metadata={
+            key: value for key, value in payload.items() if key not in standard_fields
+        },
     )
 
 
@@ -1052,6 +1805,10 @@ def _is_safe_data_path(value: str) -> bool:
         and ".." not in path.parts
         and path.suffix.casefold() == ".json"
     )
+
+
+def _is_safe_translation_path(value: str) -> bool:
+    return value == "js/plugins.js" or _is_safe_data_path(value)
 
 
 def _tree_hashes(root: Path) -> dict[Path, str]:
@@ -1110,6 +1867,44 @@ def _write_json_atomic_verified(
         return None
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return f"atomic JSON write validation failed: {exc}"
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _write_plugins_js_atomic_verified(
+    target_file: Path,
+    payload: bytes,
+    records: list[_PluginValidatedRecord],
+) -> str | None:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            delete=False,
+            dir=target_file.parent,
+            prefix=f".{target_file.name}.",
+            suffix=".tmp",
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(payload)
+        for item in records:
+            match = _PLUGIN_PARAMETER_PATH.fullmatch(item.canonical.json_path or "")
+            key = item.canonical.extra_metadata.get("storage_key")
+            if match is None or not isinstance(key, str):
+                return "patched scalar target lost its plugin/key identity"
+            resolved = resolve_plugin_parameter_binding(
+                temporary_path,
+                int(match.group("load_order")),
+                key,
+            )
+            if resolved is None or resolved[0] != item.record.translation:
+                return "patched plugins.js failed bounded registry re-resolution"
+        os.replace(temporary_path, target_file)
+        temporary_path = None
+        return None
+    except (OSError, UnicodeError, ValueError) as exc:
+        return f"atomic plugins.js write validation failed: {exc}"
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)

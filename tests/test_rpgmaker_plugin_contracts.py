@@ -92,7 +92,7 @@ Window_Test.prototype.make = function() { this.addCommand(label, 'go'); };
         self.assertEqual("js/plugins.js", entry.file)
         self.assertEqual(SemanticRole.TRANSLATABLE_TEXT.value, entry.extra_metadata["semantic_role"])
         self.assertEqual(ContractType.SCALAR_PARAMETER_TEXT.value, entry.extra_metadata["contract_type"])
-        self.assertFalse(entry.extra_metadata["apply_supported"])
+        self.assertTrue(entry.extra_metadata["apply_supported"])
         self.assertIsInstance(entry.extra_metadata["source_token_start"], int)
         self.assertEqual(1, report.summary()["extracted_entries"])
         output = self.root.parent / "plugin-source.jsonl"
@@ -173,6 +173,7 @@ Window_Test.prototype.draw = function() { this.drawText(label, 0, 0, 200); };
         self.assertEqual("Visible text", entries[0].original)
         self.assertNotIn("<Label:", entries[0].original)
         self.assertEqual(ContractType.REGEX_CAPTURE_TEXT.value, entries[0].extra_metadata["contract_type"])
+        self.assertFalse(entries[0].extra_metadata["apply_supported"])
         self.assertEqual("data/States.json", entries[0].file)
         self.assertEqual("$[1].note", entries[0].json_path)
 
@@ -200,6 +201,7 @@ Window_Test.prototype.help = function() { this._helpWindow.setText(body); };
         self.assertEqual(1, len(entries))
         self.assertEqual("Line one\nLine two", entries[0].original)
         self.assertEqual(ContractType.DELIMITED_BLOCK_TEXT.value, entries[0].extra_metadata["contract_type"])
+        self.assertTrue(entries[0].extra_metadata["apply_supported"])
 
     def test_mixed_and_dynamic_parameter_sources_are_not_extracted(self) -> None:
         self._write_plugins(

@@ -2,9 +2,8 @@
 
 This module never executes JavaScript and never writes game files.  It turns
 Phase-1 visibility evidence into semantic roles, bounded grammar contracts,
-and extraction-only translation entries tied to exact storage locations.
-Contract entries deliberately declare ``apply_supported = False``; safe
-reconstruction belongs to a later phase.
+and translation entries tied to exact storage locations.  Only contract types
+with a Phase-2B reconstruction path declare ``apply_supported = True``.
 """
 
 from __future__ import annotations
@@ -235,6 +234,13 @@ _OWNER_FILES: Mapping[str, tuple[str, ...]] = {
     "state": ("States.json",),
     "enemy": ("Enemies.json",),
 }
+
+_APPLY_SUPPORTED_CONTRACTS = frozenset(
+    {
+        ContractType.SCALAR_PARAMETER_TEXT.value,
+        ContractType.DELIMITED_BLOCK_TEXT.value,
+    }
+)
 
 
 def extract_plugin_consumed_text(
@@ -624,10 +630,9 @@ def _claims_for_note_contract(
                 )
         elif template.contract_type == ContractType.DELIMITED_BLOCK_TEXT:
             for ordinal, (start, end) in enumerate(
-                _delimited_body_spans(
+                resolve_delimited_block_spans(
                     storage.value,
-                    template.open_delimiter or "",
-                    template.close_delimiter or "",
+                    contract.parser_rule,
                 )
             ):
                 if end > start and storage.value[start:end].strip():
@@ -780,7 +785,9 @@ def _resolve_claims(
             "source_fingerprint": first.binding.source_value_sha256,
             "grammar_fingerprint": first.contract.grammar_fingerprint,
             "whitespace_policy": first.contract.whitespace_policy,
-            "apply_supported": False,
+            "apply_supported": (
+                first.contract.contract_type in _APPLY_SUPPORTED_CONTRACTS
+            ),
         }
         if first.binding.token_start is not None:
             metadata["source_token_start"] = first.binding.token_start
@@ -810,36 +817,56 @@ def _bind_parameter_token(
 ) -> StorageBinding | None:
     if record.load_order is None:
         return None
+    resolved = resolve_plugin_parameter_binding(config, record.load_order, key)
+    if resolved is None or resolved[0] != value:
+        return None
+    return resolved[1]
+
+
+def resolve_plugin_parameter_binding(
+    config: Path,
+    load_order: int,
+    key: str,
+) -> tuple[str, StorageBinding] | None:
+    """Resolve one scalar registry token without executing or rewriting JS."""
+
     try:
-        text = config.read_text(encoding="utf-8-sig")
+        # ``Path.read_text`` performs universal-newline conversion.  Token
+        # offsets must instead describe the exact decoded source so CRLF files
+        # can be patched without shifting spans or changing line endings.
+        text = config.read_bytes().decode("utf-8-sig")
         match = _REGISTRY_ASSIGNMENT.search(text)
         if match is None:
             return None
         payload = match.group(1)
         object_spans = _top_level_object_spans(payload)
-        if not 0 <= record.load_order < len(object_spans):
+        if not 0 <= load_order < len(object_spans):
             return None
-        record_start, record_end = object_spans[record.load_order]
+        record_start, record_end = object_spans[load_order]
         located = _parameter_string_tokens(payload, record_start, record_end).get(key)
-        if located is None or located[0] != value:
+        if located is None:
             return None
+        value = located[0]
         token_start = match.start(1) + located[1]
         token_end = match.start(1) + located[2]
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return None
-    return StorageBinding(
-        file="js/plugins.js",
-        json_path=f"$[{record.load_order}].parameters",
-        storage_type="plugins_js_parameter_string",
-        storage_identity=(
-            f"js/plugins.js:$plugins[{record.load_order}].parameters[{key!r}]"
+    return (
+        value,
+        StorageBinding(
+            file="js/plugins.js",
+            json_path=f"$[{load_order}].parameters",
+            storage_type="plugins_js_parameter_string",
+            storage_identity=(
+                f"js/plugins.js:$plugins[{load_order}].parameters[{key!r}]"
+            ),
+            source_value_sha256=_sha256_text(value),
+            segment_start=0,
+            segment_end=len(value),
+            source_key=key,
+            token_start=token_start,
+            token_end=token_end,
         ),
-        source_value_sha256=_sha256_text(value),
-        segment_start=0,
-        segment_end=len(value),
-        source_key=key,
-        token_start=token_start,
-        token_end=token_end,
     )
 
 
@@ -1135,6 +1162,22 @@ def _delimited_body_spans(
             open_end = None
 
 
+def resolve_delimited_block_spans(
+    text: str,
+    parser_rule: str,
+) -> tuple[tuple[int, int], ...]:
+    """Re-resolve Phase-2A delimited bodies from their grammar rule."""
+
+    prefix = "literal_delimited_lines:"
+    if not parser_rule.startswith(prefix):
+        return ()
+    grammar = parser_rule[len(prefix) :]
+    parts = grammar.split("...", 1)
+    if len(parts) != 2 or not all(parts):
+        return ()
+    return tuple(_delimited_body_spans(text, parts[0], parts[1]))
+
+
 def _spans_overlap(left: StorageBinding, right: StorageBinding) -> bool:
     return max(left.segment_start, right.segment_start) < min(
         left.segment_end, right.segment_end
@@ -1222,4 +1265,6 @@ __all__ = [
     "StorageBinding",
     "classify_semantic_role",
     "extract_plugin_consumed_text",
+    "resolve_delimited_block_spans",
+    "resolve_plugin_parameter_binding",
 ]
