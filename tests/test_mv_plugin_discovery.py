@@ -217,6 +217,121 @@ Game_Interpreter.prototype.secondRoute = function(name, values) {
         self.assertEqual("lower", item.command_normalization)
         self.assertEqual("single_token", item.argument_mode)
 
+    def test_literal_map_helper_dispatch_reaches_internal_sink(self) -> None:
+        report = self._write({"RouteFixture": """
+var routePrefix = 'ZX_';
+var commandRoutes = new Map();
+var addRoute = function(commandName, targetName) {
+ commandRoutes.set(routePrefix + commandName, targetName);
+};
+var normalizeArguments = function(values) {
+ for (var index = 0; index < values.length; index++) {
+  values[index] = normalizeArgument(values[index]);
+ }
+ return values;
+};
+var normalizeArgument = function(value) { return String(value); };
+addRoute('AUDIO_CUE', 'runAudioCue');
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ var destination = commandRoutes.get(command.toUpperCase());
+ if (destination) {
+  this[destination](normalizeArguments(args));
+ }
+};
+Game_Interpreter.prototype.runAudioCue = function(values) {
+ AudioManager.playSe({name: values[0], volume: 90, pitch: 100, pan: 0});
+};
+"""})
+        self.assertEqual(1, len(report.observations))
+        item = report.observations[0]
+        self.assertEqual("ZX_AUDIO_CUE", item.command)
+        self.assertEqual("map_dispatch", item.handler_kind)
+        self.assertEqual("upper", item.command_normalization)
+        self.assertEqual(INTERNAL, item.classification)
+        self.assertEqual("identifier", item.argument_mode)
+        self.assertEqual((0,), item.consumed_arguments)
+        self.assertEqual("AudioManager", item.sink)
+
+    def test_direct_map_dispatch_reaches_visible_sink(self) -> None:
+        report = self._write({"VisibleRouteFixture": """
+var routes = new Map();
+routes.set('ANNOUNCE_NOW', 'showAnnouncement');
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ var target = routes.get(command);
+ if (target) {
+  this[target](args);
+ }
+};
+Game_Interpreter.prototype.showAnnouncement = function(words) {
+ $gameMessage.add(words.join(' '));
+};
+"""})
+        self.assertEqual(1, len(report.observations))
+        item = report.observations[0]
+        self.assertEqual("ANNOUNCE_NOW", item.command)
+        self.assertEqual(APPLY_VERIFIED, item.classification)
+        self.assertEqual("joined_remainder", item.argument_mode)
+        self.assertEqual("$gameMessage.add", item.sink)
+
+    def test_ambiguous_map_dispatch_patterns_remain_unresolved(self) -> None:
+        cases = {
+            "dynamic_key": """
+var prefix = 'D_'; var runtimeValue = getRuntimeValue();
+var routes = new Map(); routes.set(prefix + runtimeValue, 'runRoute');
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ var target = routes.get(command); if (target) { this[target](args); }
+};
+Game_Interpreter.prototype.runRoute = function(values) { $gameMessage.add(values[0]); };
+""",
+            "dynamic_method": """
+var runtimeMethod = getRuntimeMethod();
+var routes = new Map(); routes.set('DYNAMIC_METHOD', runtimeMethod);
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ var target = routes.get(command); if (target) { this[target](args); }
+};
+""",
+            "duplicate_registration": """
+var routes = new Map();
+routes.set('DUPLICATE_ROUTE', 'runA'); routes.set('DUPLICATE_ROUTE', 'runB');
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ var target = routes.get(command); if (target) { this[target](args); }
+};
+Game_Interpreter.prototype.runA = function(values) { $gameMessage.add(values[0]); };
+Game_Interpreter.prototype.runB = function(values) { $gameMessage.add(values[0]); };
+""",
+            "reassigned_map": """
+var routes = new Map(); routes.set('REASSIGNED', 'runRoute'); routes = otherRoutes;
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ var target = routes.get(command); if (target) { this[target](args); }
+};
+Game_Interpreter.prototype.runRoute = function(values) { $gameMessage.add(values[0]); };
+""",
+            "arbitrary_computed_method": """
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ this[command](args);
+};
+""",
+            "runtime_lookup": """
+var routes = new Map(); routes.set('RUNTIME_LOOKUP', 'runRoute');
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ var target = routes.get(otherRuntimeValue); if (target) { this[target](args); }
+};
+Game_Interpreter.prototype.runRoute = function(values) { $gameMessage.add(values[0]); };
+""",
+            "reordered_wrapper": """
+var routes = new Map(); routes.set('REORDERED', 'runRoute');
+function reorder(values) { return [values[1], values[0]]; }
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ var target = routes.get(command); if (target) { this[target](reorder(args)); }
+};
+Game_Interpreter.prototype.runRoute = function(values) { $gameMessage.add(values[0]); };
+""",
+        }
+        for name, source in cases.items():
+            with self.subTest(name=name):
+                report = self._write({"ConservativeMap": source})
+                self.assertEqual([], report.observations)
+
     def test_display_configuration_and_dynamic_helper_are_not_verified(self) -> None:
         report = self._write({"Conservative": """
 Game_Screen.prototype.setWindowTextAlign = function(value) {

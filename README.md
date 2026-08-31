@@ -1,7 +1,7 @@
 # Game Localization Toolkit (GLT)
 
 Windows 11에서 일본 동인게임의 번역 가능한 문자열을 안전하게 다루기 위한
-개인용 Python 도구입니다. 현재 버전은 **GLT 0.9.1**이며 RPG Maker MV/MZ의
+개인용 Python 도구입니다. 현재 버전은 **GLT 0.9.2**이며 RPG Maker MV/MZ의
 엔진 감지, UTF-8 JSONL 추출, 별도 폴더 안전 적용, 독립 QA, dry-run,
 fingerprint와 이식 가능한 번역 Project, 사용자 Glossary 및 JSONL Translation
 Memory, 폰트 진단과 안전한 기본 폰트 패치를 구현합니다. 대용량 번역 JSONL은
@@ -1099,3 +1099,21 @@ formatting/control token을 유지하고 승인된 span만 교체합니다. 실�
 preflight, 대표 8개 round-trip, 재추출 ID/storage identity 및 `NO_CHANGE` 안정성을
 검증했습니다. 서로 다른 plugin/tag/property 이름의 synthetic regression도 같은
 behavioral classification과 contract를 통과합니다. Schema version 1은 유지됩니다.
+
+## 0.9.2 MV Map-based plugin-command dispatch
+
+MV plugin이 local `new Map()` registry에 고정 문자열 key와 method 이름을
+결정적으로 등록하고, command에서 유도한 `Map.get()` 결과를 guard한 뒤 computed
+method로 전달하는 흐름을 bounded static analysis로 해석합니다. 고정 문자열 prefix와
+단순 concatenation, argument 순서를 보존하는 제한된 wrapper만 허용하며 최종 판정은
+기존 display/internal sink 분류를 재사용합니다. 모호한 registration, alias, guard,
+target 또는 argument 흐름은 검증하지 않고 기존의 보수적 fallback으로 남깁니다.
+
+실게임 read-only 검증에서 이전에 conditional이던 MV plugin-command 14,053건이
+해결된 runtime flow 근거로 안전하게 `INTERNAL` 판정되었고 translation entry 수는
+변하지 않았습니다. Plugin/command 이름을 위한 예외는 추가하지 않았습니다.
+Object/array dispatch table, function-valued Map entry, multi-step/runtime registration,
+Map alias/external passing, 복잡한 guard, 더 깊은 unresolved helper chain 및
+destructuring/spread argument forwarding은 지원하지 않습니다. 상세 내용은
+[MV Map-dispatch analysis](docs/rpgmaker_mv_map_dispatch_0.9.2.md)에 정리되어 있으며
+JSONL 및 artifact schema version은 계속 `1`입니다.

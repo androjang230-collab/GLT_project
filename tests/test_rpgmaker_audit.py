@@ -185,6 +185,47 @@ Game_Interpreter.prototype.pluginCommand = function(command, args) {
         self.assertEqual("$gameMessage.add", row["sink"])
         self.assertTrue(report.plugin_discovery["source_unchanged"])
 
+    def test_mv_map_dispatch_updates_semantic_audit_classification(self) -> None:
+        game = _game(self.workspace, EngineId.RPGMAKER_MV)
+        _write_json(game, "Map001.json", _map([
+            _command(356, ["QX_SOUND sound_asset"]),
+            _command(356, ["QX_NOTICE visible words"]),
+        ]))
+        (game / "js/plugins.js").write_text(
+            'var $plugins = [{"name":"MapRoutes","status":true,"description":"","parameters":{}}];',
+            encoding="utf-8",
+        )
+        (game / "js/plugins/MapRoutes.js").write_text("""
+const prefix = 'QX_';
+const routes = new Map();
+function registerRoute(name, method) { routes.set(prefix + name, method); }
+registerRoute('SOUND', 'playSound');
+registerRoute('NOTICE', 'showNotice');
+Game_Interpreter.prototype.pluginCommand = function(command, args) {
+ const target = routes.get(command.toUpperCase());
+ if (target) { this[target](args); }
+};
+Game_Interpreter.prototype.playSound = function(values) {
+ AudioManager.playSe({name: values[0]});
+};
+Game_Interpreter.prototype.showNotice = function(values) {
+ $gameMessage.add(values.join(' '));
+};
+""", encoding="utf-8")
+        report = RpgMakerCoverageAuditor(EngineId.RPGMAKER_MV).audit(game)
+        rows = {
+            item["prefix"]: item
+            for item in report.statistics["plugin_command_coverage"]["mv_356"]["prefixes"]
+        }
+        self.assertEqual("INTERNAL", rows["QX_SOUND"]["classification"])
+        self.assertEqual("INTERNAL", rows["QX_SOUND"]["discovery_classification"])
+        self.assertEqual("AudioManager", rows["QX_SOUND"]["sink"])
+        self.assertEqual("VERIFIED_TRANSLATABLE", rows["QX_NOTICE"]["classification"])
+        self.assertEqual("APPLY_VERIFIED", rows["QX_NOTICE"]["discovery_classification"])
+        self.assertEqual("joined_remainder", rows["QX_NOTICE"]["argument_mode"])
+        self.assertEqual(1, report.statistics["plugin_command_coverage"]["mv_356"]["verified"])
+        self.assertEqual(1, report.statistics["plugin_command_coverage"]["mv_356"]["internal"])
+
     def test_mz_357_recursively_observes_nested_arguments(self) -> None:
         report = self._audit([_command(357, ["LogPlugin", "addLog", "Add Log", {"text": "表示文", "nested": {"lines": ["一", "二"]}, "count": 3}])])
         self.assertEqual(3, len(report.candidates))
@@ -349,7 +390,7 @@ PluginManager.registerCommand('AuditPlugin', 'addLog', args => {});
                 "--csv", str(csv_path),
             ])
         self.assertEqual(0, code)
-        self.assertEqual("0.9.1", json.loads(report_path.read_text(encoding="utf-8"))["tool_version"])
+        self.assertEqual("0.9.2", json.loads(report_path.read_text(encoding="utf-8"))["tool_version"])
         self.assertTrue(csv_path.read_text(encoding="utf-8-sig").startswith("file,json_path,"))
 
     def test_cli_accepts_external_read_only_plugin_evidence(self) -> None:

@@ -24,6 +24,8 @@ from engines.rpgmaker.plugin_inventory import (
 MAX_PLUGIN_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_PLUGIN_BYTES = 512 * 1024 * 1024
 MAX_HANDLERS = 10_000
+MAX_LOCAL_MAPS = 128
+MAX_MAP_REGISTRATIONS = 2_048
 
 APPLY_VERIFIED = "APPLY_VERIFIED"
 DISCOVERED_VERIFIED = "DISCOVERED_VERIFIED"
@@ -134,6 +136,8 @@ class _Function:
     parameters: tuple[str, ...]
     body: str
     kind: str
+    body_start: int
+    body_end: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +146,13 @@ class _Flow:
     indices: tuple[int, ...]
     start: int | None
     numeric: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _MapDispatchSite:
+    map_name: str
+    normalization: str
+    argument_wrapper: str | None
 
 
 def discover_mv_plugin_commands(
@@ -214,11 +225,14 @@ def discover_mv_plugin_commands(
             )
             continue
         report.source_resolved_plugins += 1
-        functions = _extract_functions(_strip_comments(source))
+        stripped_source = _strip_comments(source)
+        functions = _extract_functions(stripped_source)
         direct = [item for item in functions if item.name == "Game_Interpreter.prototype.pluginCommand"]
         handler_count += len(direct)
         for handler in direct:
-            observations.extend(_analyze_handler(plugin, handler, functions))
+            observations.extend(
+                _analyze_handler(plugin, handler, functions, stripped_source)
+            )
         if handler_count > MAX_HANDLERS:
             raise ValueError(f"pluginCommand handler count exceeds {MAX_HANDLERS}")
 
@@ -301,7 +315,19 @@ def _extract_functions(source: str) -> list[_Function]:
             if end is None:
                 continue
             params = tuple(part.strip() for part in match.group("params").split(",") if part.strip())
-            found.append((match.start(), _Function(match.group("name"), params, source[match.end():end - 1], kind)))
+            found.append(
+                (
+                    match.start(),
+                    _Function(
+                        match.group("name"),
+                        params,
+                        source[match.end():end - 1],
+                        kind,
+                        match.end(),
+                        end - 1,
+                    ),
+                )
+            )
     return [item for _, item in sorted(found, key=lambda pair: pair[0])]
 
 
@@ -323,7 +349,12 @@ def _balanced_end(text: str, start: int, opening: str, closing: str) -> int | No
     return None
 
 
-def _analyze_handler(plugin: _PluginRecord, handler: _Function, functions: list[_Function]) -> list[MvPluginDiscovery]:
+def _analyze_handler(
+    plugin: _PluginRecord,
+    handler: _Function,
+    functions: list[_Function],
+    source: str,
+) -> list[MvPluginDiscovery]:
     if len(handler.parameters) < 2:
         return []
     results: list[MvPluginDiscovery] = []
@@ -336,7 +367,480 @@ def _analyze_handler(plugin: _PluginRecord, handler: _Function, functions: list[
             results.append(
                 _classify_branch(plugin, literal, normalization, branch, argument_name, functions, kind, dispatch_chain)
             )
+    results.extend(
+        _analyze_map_dispatch(plugin, handler, functions, source)
+    )
     return results
+
+
+_LOCAL_MAP_DECLARATION = re.compile(
+    r"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+Map\s*\(\s*\)\s*;"
+)
+
+
+def _analyze_map_dispatch(
+    plugin: _PluginRecord,
+    handler: _Function,
+    functions: list[_Function],
+    source: str,
+) -> list[MvPluginDiscovery]:
+    """Resolve a small, literal Map registry tied to pluginCommand dispatch."""
+
+    if plugin.enabled is not True:
+        return []
+    map_names = [match.group(1) for match in _LOCAL_MAP_DECLARATION.finditer(source)]
+    if len(map_names) > MAX_LOCAL_MAPS:
+        return []
+    declared_once = {name for name in map_names if map_names.count(name) == 1}
+    sites = [
+        site for site in _map_dispatch_sites(handler, functions)
+        if site.map_name in declared_once
+    ]
+    grouped_sites: dict[str, list[_MapDispatchSite]] = {}
+    for site in sites:
+        grouped_sites.setdefault(site.map_name, []).append(site)
+
+    results: list[MvPluginDiscovery] = []
+    for map_name, candidates in grouped_sites.items():
+        distinct = {
+            (item.normalization, item.argument_wrapper) for item in candidates
+        }
+        if len(distinct) != 1 or not _map_is_stable(source, map_name):
+            continue
+        registrations = _literal_map_registrations(
+            source, map_name, functions
+        )
+        if registrations is None:
+            continue
+        site = candidates[0]
+        for command, method_name in registrations.items():
+            if not _registration_matches_normalization(command, site.normalization):
+                continue
+            if not re.fullmatch(r"[A-Za-z_$][\w$]*", method_name):
+                continue
+            target = _resolve_function(f"this.{method_name}", functions)
+            if target is None or not target.parameters:
+                continue
+            helper_chain = tuple(
+                value for value in (site.argument_wrapper, method_name) if value
+            )
+            results.append(
+                _classify_branch(
+                    plugin,
+                    command,
+                    site.normalization,
+                    target.body,
+                    target.parameters[0],
+                    functions,
+                    "map_dispatch",
+                    helper_chain,
+                )
+            )
+    return results
+
+
+def _map_dispatch_sites(
+    handler: _Function,
+    functions: list[_Function],
+) -> list[_MapDispatchSite]:
+    command_var, args_var = handler.parameters[:2]
+    expressions = _command_expressions(handler.body, command_var, functions)
+    result: list[_MapDispatchSite] = []
+    lookup = re.compile(
+        r"(?:var|let|const)\s+(?P<target>[A-Za-z_$][\w$]*)\s*=\s*"
+        r"(?P<map>[A-Za-z_$][\w$]*)\.get\s*\("
+    )
+    for match in lookup.finditer(handler.body):
+        end = _balanced_end(handler.body, match.end() - 1, "(", ")")
+        if end is None:
+            continue
+        lookup_arguments = _split_arguments(handler.body[match.end():end - 1])
+        if len(lookup_arguments) != 1:
+            continue
+        expression = lookup_arguments[0].strip()
+        normalization = expressions.get(expression)
+        if normalization is None:
+            normalization = _resolve_command_transform(
+                expression, command_var, functions
+            )
+        if normalization is None:
+            continue
+        target = match.group("target")
+        if _assignment_count(handler.body, target) != 1:
+            continue
+        wrappers = _guarded_computed_forwarding(
+            handler.body, target, args_var, functions
+        )
+        for wrapper in wrappers:
+            result.append(
+                _MapDispatchSite(match.group("map"), normalization, wrapper)
+            )
+    return result
+
+
+def _guarded_computed_forwarding(
+    body: str,
+    lookup_target: str,
+    args_var: str,
+    functions: list[_Function],
+) -> list[str | None]:
+    target_aliases = _direct_alias_names(body, lookup_target)
+    argument_aliases = _direct_alias_names(body, args_var)
+    result: list[str | None] = []
+    for guarded_name in sorted(target_aliases):
+        guard = re.compile(
+            rf"\bif\s*\(\s*{re.escape(guarded_name)}\s*\)\s*\{{"
+        )
+        for match in guard.finditer(body):
+            end = _balanced_end(body, match.end() - 1, "{", "}")
+            if end is None:
+                continue
+            branch = body[match.end():end - 1]
+            computed = re.compile(
+                r"\bthis\s*\[\s*(?P<target>[A-Za-z_$][\w$]*)\s*\]\s*\("
+            )
+            for call in computed.finditer(branch):
+                if call.group("target") not in target_aliases:
+                    continue
+                call_end = _balanced_end(branch, call.end() - 1, "(", ")")
+                if call_end is None:
+                    continue
+                arguments = _split_arguments(branch[call.end():call_end - 1])
+                if len(arguments) != 1:
+                    continue
+                forwarded, wrapper = _forwarded_argument_wrapper(
+                    arguments[0], argument_aliases, functions
+                )
+                if forwarded and wrapper not in result:
+                    result.append(wrapper)
+    return result
+
+
+def _forwarded_argument_wrapper(
+    expression: str,
+    argument_aliases: set[str],
+    functions: list[_Function],
+) -> tuple[bool, str | None]:
+    value = expression.strip()
+    if value in argument_aliases:
+        return True, None
+    calls = list(_iter_named_calls_with_positions(value))
+    if len(calls) != 1:
+        return False, None
+    start, end, name, arguments = calls[0]
+    if start != 0 or end != len(value) or len(arguments) != 1:
+        return False, None
+    if arguments[0].strip() not in argument_aliases:
+        return False, None
+    helper = _resolve_function(name, functions)
+    if helper is None or not _is_array_identity_wrapper(helper):
+        return False, None
+    return True, _short_function_name(helper.name)
+
+
+def _is_array_identity_wrapper(helper: _Function) -> bool:
+    if len(helper.parameters) != 1:
+        return False
+    parameter = helper.parameters[0]
+    escaped = re.escape(parameter)
+    returns = re.findall(r"\breturn\s+([^;]+);", helper.body)
+    if len(returns) != 1 or returns[0].strip() not in {
+        parameter, f"({parameter})"
+    }:
+        return False
+    if re.search(
+        rf"\b{escaped}\s*\.\s*(?:pop|push|shift|unshift|splice|sort|reverse|concat|slice)\s*\(",
+        helper.body,
+    ):
+        return False
+    if re.search(rf"\b{escaped}\s*\.\s*length\s*=", helper.body):
+        return False
+    if re.search(rf"\bdelete\s+{escaped}\s*\[", helper.body):
+        return False
+    if re.search(rf"(?<![.\w$]){escaped}\s*=(?!=)", helper.body):
+        return False
+    if re.search(
+        rf"(?:var|let|const)\s+[A-Za-z_$][\w$]*\s*=\s*{escaped}\s*;",
+        helper.body,
+    ):
+        return False
+    if any(
+        argument.strip() == parameter
+        for _, _, _, arguments in _iter_named_calls_with_positions(helper.body)
+        for argument in arguments
+    ):
+        return False
+
+    writes = list(
+        re.finditer(
+            rf"\b{escaped}\s*\[\s*(?P<index>[^\]]+)\s*\]\s*=\s*(?P<value>[^;]+);",
+            helper.body,
+        )
+    )
+    for write in writes:
+        index = write.group("index").strip()
+        value = write.group("value").strip()
+        calls = list(_iter_named_calls_with_positions(value))
+        if len(calls) != 1:
+            return False
+        start, end, _, arguments = calls[0]
+        if start != 0 or end != len(value) or len(arguments) != 1:
+            return False
+        expected = re.sub(r"\s+", "", f"{parameter}[{index}]")
+        if re.sub(r"\s+", "", arguments[0]) != expected:
+            return False
+        if not re.fullmatch(r"\d+", index):
+            loop = re.compile(
+                rf"for\s*\([^;]*\b{re.escape(index)}\b[^;]*;"
+                rf"[^;]*\b{re.escape(index)}\b\s*<\s*{escaped}\.length\s*;"
+                rf"[^)]*(?:\+\+\s*{re.escape(index)}|{re.escape(index)}\s*\+\+)\s*\)"
+            )
+            if loop.search(helper.body) is None:
+                return False
+    remaining_writes = re.sub(
+        rf"\b{escaped}\s*\[\s*[^\]]+\s*\]\s*=\s*[^;]+;",
+        "",
+        helper.body,
+    )
+    if re.search(rf"\b{escaped}\s*\[.*?\]\s*=", remaining_writes):
+        return False
+    return True
+
+
+def _map_is_stable(source: str, map_name: str) -> bool:
+    if _assignment_count(source, map_name) != 1:
+        return False
+    escaped = re.escape(map_name)
+    alias = re.search(
+        rf"(?:var|let|const)\s+(?!{escaped}\b)[A-Za-z_$][\w$]*\s*=\s*{escaped}\s*;",
+        source,
+    )
+    if alias is not None:
+        return False
+    return not any(
+        argument.strip() == map_name
+        for _, _, _, arguments in _iter_named_calls_with_positions(source)
+        for argument in arguments
+    )
+
+
+def _assignment_count(source: str, name: str) -> int:
+    return len(
+        re.findall(
+            rf"(?<![.\w$]){re.escape(name)}\s*"
+            rf"(?:=(?!=)|\+=|-=|\*=|/=|%=|\+\+|--)",
+            source,
+        )
+    )
+
+
+def _literal_map_registrations(
+    source: str,
+    map_name: str,
+    functions: list[_Function],
+) -> dict[str, str] | None:
+    constants = _static_string_constants(source)
+    template_positions: set[int] = set()
+    templates: dict[str, tuple[_Function, str, str]] = {}
+    receiver = f"{map_name}.set"
+    for helper in functions:
+        calls = [
+            (start, arguments)
+            for start, _, name, arguments in _iter_named_calls_with_positions(helper.body)
+            if name == receiver
+        ]
+        if len(calls) != 1 or not helper.parameters or "." in helper.name:
+            continue
+        start, arguments = calls[0]
+        if len(arguments) != 2:
+            continue
+        placeholders = {name: name for name in helper.parameters}
+        if (
+            _resolve_static_string(arguments[0], constants, placeholders) is None
+            or _resolve_static_string(arguments[1], constants, placeholders) is None
+        ):
+            continue
+        templates[helper.name] = (helper, arguments[0], arguments[1])
+        template_positions.add(helper.body_start + start)
+
+    registrations: list[tuple[str, str]] = []
+    calls = list(_iter_named_calls_with_positions(source))
+    for start, _, name, arguments in calls:
+        if name in {f"{map_name}.delete", f"{map_name}.clear"}:
+            return None
+        if name != receiver or start in template_positions:
+            continue
+        if _position_inside_function(start, functions):
+            return None
+        if len(arguments) != 2:
+            return None
+        key = _resolve_static_string(arguments[0], constants, {})
+        method = _resolve_static_string(arguments[1], constants, {})
+        if key is None or method is None:
+            return None
+        registrations.append((key, method))
+
+    for helper_name, (helper, key_expression, method_expression) in templates.items():
+        helper_calls = [
+            (start, arguments)
+            for start, _, name, arguments in calls if name == helper_name
+        ]
+        for start, arguments in helper_calls:
+            if _position_inside_function(start, functions):
+                return None
+            if len(arguments) != len(helper.parameters):
+                return None
+            bindings: dict[str, str] = {}
+            for parameter, argument in zip(helper.parameters, arguments):
+                value = _resolve_static_string(argument, constants, {})
+                if value is None:
+                    return None
+                bindings[parameter] = value
+            key = _resolve_static_string(key_expression, constants, bindings)
+            method = _resolve_static_string(
+                method_expression, constants, bindings
+            )
+            if key is None or method is None:
+                return None
+            registrations.append((key, method))
+
+    if not registrations or len(registrations) > MAX_MAP_REGISTRATIONS:
+        return None
+    grouped: dict[str, list[str]] = {}
+    for key, method in registrations:
+        grouped.setdefault(key, []).append(method)
+    return {
+        key: methods[0]
+        for key, methods in grouped.items()
+        if len(methods) == 1
+    }
+
+
+def _position_inside_function(position: int, functions: list[_Function]) -> bool:
+    return any(
+        helper.body_start <= position < helper.body_end for helper in functions
+    )
+
+
+def _static_string_constants(source: str) -> dict[str, str]:
+    candidates: dict[str, list[str]] = {}
+    declaration = re.compile(
+        r"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+        r"((?:'(?:\\.|[^'\\])*')|(?:\"(?:\\.|[^\"\\])*\"))\s*;"
+    )
+    for match in declaration.finditer(source):
+        value = _decode_js_string_literal(match.group(2))
+        if value is not None:
+            candidates.setdefault(match.group(1), []).append(value)
+    return {
+        name: values[0]
+        for name, values in candidates.items()
+        if len(values) == 1 and _assignment_count(source, name) == 1
+    }
+
+
+def _resolve_static_string(
+    expression: str,
+    constants: dict[str, str],
+    bindings: dict[str, str],
+) -> str | None:
+    value = expression.strip()
+    while value.startswith("(") and value.endswith(")"):
+        end = _balanced_end(value, 0, "(", ")")
+        if end != len(value):
+            break
+        value = value[1:-1].strip()
+    parts = _split_top_level_plus(value)
+    if parts is None:
+        return None
+    resolved: list[str] = []
+    for part in parts:
+        token = part.strip()
+        literal = _decode_js_string_literal(token)
+        if literal is not None:
+            resolved.append(literal)
+        elif token in bindings:
+            resolved.append(bindings[token])
+        elif token in constants:
+            resolved.append(constants[token])
+        else:
+            return None
+    return "".join(resolved)
+
+
+def _split_top_level_plus(expression: str) -> list[str] | None:
+    result: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(expression):
+        char = expression[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif char == "+" and depth == 0:
+            result.append(expression[start:index])
+            start = index + 1
+        index += 1
+    if quote or depth != 0:
+        return None
+    result.append(expression[start:])
+    return result if all(part.strip() for part in result) else None
+
+
+def _decode_js_string_literal(value: str) -> str | None:
+    if len(value) < 2 or value[0] not in {"'", '"'} or value[-1] != value[0]:
+        return None
+    result: list[str] = []
+    index = 1
+    escapes = {
+        "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+        "v": "\v", "0": "\0", "\\": "\\", "'": "'", '"': '"', "/": "/",
+    }
+    while index < len(value) - 1:
+        char = value[index]
+        if char != "\\":
+            result.append(char)
+            index += 1
+            continue
+        index += 1
+        if index >= len(value) - 1:
+            return None
+        escaped = value[index]
+        if escaped in escapes:
+            result.append(escapes[escaped])
+            index += 1
+            continue
+        if escaped in {"x", "u"}:
+            width = 2 if escaped == "x" else 4
+            digits = value[index + 1:index + 1 + width]
+            if len(digits) != width or not re.fullmatch(r"[0-9A-Fa-f]+", digits):
+                return None
+            result.append(chr(int(digits, 16)))
+            index += width + 1
+            continue
+        return None
+    return "".join(result)
+
+
+def _registration_matches_normalization(command: str, normalization: str) -> bool:
+    if normalization == "upper":
+        return command == command.upper()
+    if normalization == "lower":
+        return command == command.lower()
+    return normalization == "exact"
 
 
 def _dispatch_bodies(
@@ -605,9 +1109,14 @@ def _classify_branch(
         flow = flows[0] if flows else _Flow("unknown", (), None)
         return _observation(plugin, command, command_normalization, handler_kind, flow, tuple(helper_chain), "eval", "unsafe", UNSAFE, "high", "unknown")
     if any(flow.numeric for flow in flows) or (_INTERNAL_HINT.search(branch) and (flows or not re.search(rf"\b{re.escape(args_var)}\b", branch))):
-        flow = flows[0] if flows else _Flow("identifier", (), None)
-        mode = "numeric" if any(item.numeric for item in flows) else "identifier"
-        flow = replace(flow, mode=mode)
+        indices = tuple(sorted({index for item in flows for index in item.indices}))
+        numeric = bool(flows) and all(item.numeric for item in flows)
+        flow = _Flow(
+            "numeric" if numeric else "identifier",
+            indices,
+            min(indices) if indices else None,
+            numeric,
+        )
         return _observation(plugin, command, command_normalization, handler_kind, flow, tuple(helper_chain), _internal_sink(branch), "internal", INTERNAL, "high", "unknown")
     flow = flows[0] if flows else _Flow("unknown", (), None)
     reason = "argument flow does not reach a recognized display or internal sink"
@@ -762,6 +1271,20 @@ def _all_flows(body: str, args_var: str, aliases: dict[str, str]) -> Iterator[_F
             flow = _parse_flow(candidate, args_var, aliases)
             if flow is not None and flow not in seen:
                 seen.add(flow); yield flow
+    represented = {index for item in seen for index in item.indices}
+    for index_text in re.findall(rf"\b{re.escape(args_var)}\s*\[\s*(\d+)\s*\]", body):
+        index = int(index_text)
+        if index in represented:
+            continue
+        flow = _Flow(
+            "single_token" if index == 0 else "fixed_index",
+            (index,),
+            index,
+        )
+        if flow not in seen:
+            seen.add(flow)
+            represented.add(index)
+            yield flow
 
 
 def _parse_flow(
@@ -887,6 +1410,13 @@ def _split_arguments(value: str) -> list[str]:
 
 
 def _iter_named_calls(value: str) -> Iterator[tuple[str, list[str]]]:
+    for _, _, name, arguments in _iter_named_calls_with_positions(value):
+        yield name, arguments
+
+
+def _iter_named_calls_with_positions(
+    value: str,
+) -> Iterator[tuple[int, int, str, list[str]]]:
     pattern = re.compile(
         r"(?<!function\s)(?P<name>(?:this\.|\$?[A-Za-z_$][\w$]*\.)*"
         r"[A-Za-z_$][\w$]*)\s*\("
@@ -895,7 +1425,12 @@ def _iter_named_calls(value: str) -> Iterator[tuple[str, list[str]]]:
         end = _balanced_end(value, match.end() - 1, "(", ")")
         if end is None:
             continue
-        yield match.group("name"), _split_arguments(value[match.end():end - 1])
+        yield (
+            match.start(),
+            end,
+            match.group("name"),
+            _split_arguments(value[match.end():end - 1]),
+        )
 
 
 def _short_function_name(name: str) -> str:
